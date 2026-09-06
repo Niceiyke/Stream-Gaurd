@@ -13,6 +13,8 @@
 
 use sg_core::error::{Error, Result};
 
+pub mod gateway_net;
+
 /// Named seam for platform-specific construction — this is where the real
 /// adapter creation (Wintun, rtnetlink, utun, NE, VpnService) will live.
 pub trait PlatformAdapter: Send + Sync {

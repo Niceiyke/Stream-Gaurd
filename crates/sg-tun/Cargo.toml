@@ -6,6 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 description = "StreamGuard cross-platform virtual NIC abstraction"
 
+[features]
+default = []
+# Enables the real tun-rs (crates.io `tun`) platform backend: Wintun on
+# Windows, /dev/net/tun on Linux, utun on macOS. Off by default because
+# tun-rs's Windows build.rs shells out to `cargo metadata` (fails on some
+# toolchains); enable on the target box when the platform milestone lands.
+native-tun = ["dep:tun"]
+
 [dependencies]
 bytes.workspace = true
 sg-core.workspace = true
+tun = { workspace = true, optional = true }

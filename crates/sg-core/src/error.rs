@@ -34,4 +34,7 @@ impl Error {
     pub fn platform(msg: impl Into<String>) -> Self {
         Self::Platform(msg.into())
     }
+    pub fn io(msg: impl Into<String>) -> Self {
+        Self::Io(std::io::Error::other(msg.into()))
+    }
 }
