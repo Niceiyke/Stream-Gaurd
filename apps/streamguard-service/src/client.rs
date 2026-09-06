@@ -24,7 +24,7 @@ use sg_core::{PathId, SessionId};
 use sg_health::{DefaultScorer, PathMetrics, Scorer};
 use sg_protocol::{Envelope, PacketType, VERSION};
 use sg_session::Session;
-use sg_transport::quic::connect_path;
+use sg_transport::quic::{bootstrap_v1, connect_path};
 use sg_transport::PathTransport;
 use sg_tun::Tun;
 use tokio::sync::{Mutex, oneshot};
@@ -86,8 +86,10 @@ impl<T: Tun + Send + 'static> ClientHandle<T> {
     }
 }
 
-/// Opens one QUIC path to the gateway per entry and binds each to the
-/// session, then starts the uplink + downlink loops.
+/// Opens one QUIC path to the gateway per entry, authenticates each with the
+/// v1 bootstrap handshake (`token` = gateway-signed session ticket), binds
+/// the accredited paths to the session, then starts the uplink + downlink
+/// loops.
 pub async fn start<T: Tun + Send + 'static>(
     tun: T,
     addr: std::net::SocketAddr,
@@ -95,6 +97,7 @@ pub async fn start<T: Tun + Send + 'static>(
     client_config: quinn::ClientConfig,
     session_id: SessionId,
     paths: &[PathId],
+    token: &str,
 ) -> anyhow::Result<ClientHandle<T>> {
     let tun: Arc<Mutex<T>> = Arc::new(Mutex::new(tun));
     let counters = Arc::new(Mutex::new(Counters::default()));
@@ -106,6 +109,12 @@ pub async fn start<T: Tun + Send + 'static>(
     // bound path becomes the initial active path; health re-ranks later.
     for path_id in paths.iter().copied() {
         let path = connect_path(addr, server_name, client_config.clone(), path_id).await?;
+        // Each path must present the signed session ticket before it can
+        // carry traffic for this session (spec 15.5 / engineering step 8).
+        let accredited = bootstrap_v1(&path, session_id, token).await?;
+        if accredited != session_id {
+            anyhow::bail!("gateway accredited a different session ({accredited:?})");
+        }
         let path: Arc<dyn PathTransport> = Arc::new(path);
         transports.push((path_id, path.clone()));
         session.add_path(path, path_id)?;
@@ -364,7 +373,8 @@ mod tests {
         let gateway = GatewayQuic::bind("127.0.0.1:0".parse().unwrap(), server_cfg).unwrap();
         let addr = gateway.local_addr().unwrap();
 
-        // Naive echo gateway: accept the path and bounce every envelope.
+        // Naive echo gateway: answer the bootstrap Control/Init with an Ack,
+        // and bounce every data envelope back to the client as Data.
         let server = gateway.clone();
         let echo_task = tokio::spawn(async move {
             let path = server.accept(PathId::new(1)).await.unwrap();
@@ -373,28 +383,48 @@ mod tests {
                     Ok(e) => e,
                     Err(_) => break,
                 };
-                let reply = Envelope {
-                    version: VERSION,
-                    packet_type: PacketType::Data,
-                    flags: 0,
-                    path_id: e.path_id,
-                    session_id: e.session_id,
-                    sequence: Sequence::new(e.sequence.get().wrapping_add(1_000_000)),
-                    timestamp_ms: e.timestamp_ms,
-                    payload: e.payload.clone(),
+                let reply = match e.packet_type {
+                    PacketType::Control => {
+                        let b = e.session_id.as_guid().as_bytes();
+                        let sid = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+                        Envelope {
+                            version: VERSION,
+                            packet_type: PacketType::Control,
+                            flags: 0,
+                            path_id: e.path_id,
+                            session_id: e.session_id,
+                            sequence: Sequence::new(e.sequence.get().wrapping_add(1_000_000)),
+                            timestamp_ms: e.timestamp_ms,
+                            payload: sg_protocol::control::ControlMsg::Ack { sid }
+                                .encode()
+                                .unwrap(),
+                        }
+                    }
+                    _ => Envelope {
+                        version: VERSION,
+                        packet_type: PacketType::Data,
+                        flags: 0,
+                        path_id: e.path_id,
+                        session_id: e.session_id,
+                        sequence: Sequence::new(e.sequence.get().wrapping_add(1_000_000)),
+                        timestamp_ms: e.timestamp_ms,
+                        payload: e.payload.clone(),
+                    },
                 };
                 let _ = path.send(reply).await;
             }
         });
 
         let tun = LoopbackTun::with_config(TunConfig::default());
+        let session_id = sg_session::session_id_from_wire(0x12345678);
         let mut handle = start(
             tun,
             addr,
             "localhost",
             client_cfg,
-            sg_session::session_id_from_wire(0x12345678),
+            session_id,
             &[PathId::new(1)],
+            "unit-test-ticket",
         )
         .await
         .unwrap();

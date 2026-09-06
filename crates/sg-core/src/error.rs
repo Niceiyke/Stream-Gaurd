@@ -10,6 +10,8 @@ pub enum Error {
     Protocol(String),
     #[error("routing error: {0}")]
     Routing(String),
+    #[error("auth error: {0}")]
+    Auth(String),
     #[error("platform error: {0}")]
     Platform(String),
     #[error("i/o error: {0}")]
@@ -30,6 +32,9 @@ impl Error {
     }
     pub fn routing(msg: impl Into<String>) -> Self {
         Self::Routing(msg.into())
+    }
+    pub fn auth(msg: impl Into<String>) -> Self {
+        Self::Auth(msg.into())
     }
     pub fn platform(msg: impl Into<String>) -> Self {
         Self::Platform(msg.into())

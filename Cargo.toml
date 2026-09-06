@@ -11,6 +11,7 @@ members = [
     "crates/sg-routing",
     "crates/sg-platform",
     "crates/sg-session",
+    "crates/sg-auth",
     "apps/streamguard-service",
     "apps/streamguard-gateway",
 ]
@@ -29,6 +30,7 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio", "log"] }
 rcgen = "0.13"
+ring = "0.17"
 rustls = { version = "0.23", features = ["ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
 tracing = "0.1"
@@ -46,6 +48,7 @@ sg-multipath = { path = "crates/sg-multipath" }
 sg-routing = { path = "crates/sg-routing" }
 sg-platform = { path = "crates/sg-platform" }
 sg-session = { path = "crates/sg-session" }
+sg-auth = { path = "crates/sg-auth" }
 
 [profile.release]
 lto = "thin"

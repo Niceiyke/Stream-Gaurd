@@ -11,10 +11,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use sg_core::error::{Error, Result};
-use sg_core::PathId;
-use sg_protocol::Envelope;
+use sg_core::{PathId, SessionId};
+use sg_protocol::control::ControlMsg;
+use sg_protocol::{Envelope, PacketType};
 
 use crate::{PathTransport, SessionTicket, async_trait};
 
@@ -109,6 +110,73 @@ pub async fn connect_path(
     Ok(QuicPathTransport::new(conn, path_id))
 }
 
+/// Performs the v1 bootstrap handshake on a fresh path (spec 15.5 /
+/// engineering step 8).
+///
+/// The client sends a `Control::Init` with its signed session ticket; the
+/// gateway replies with `Control::Ack` (path accredited for this session)
+/// or `Control::Nack` (rejected). Returns the accredited session id, or
+/// `Error::Auth` when the gateway refuses the ticket.
+pub async fn bootstrap_v1(
+    path: &QuicPathTransport,
+    session_id: SessionId,
+    token: &str,
+) -> Result<SessionId> {
+    let init = sg_protocol::control::ControlMsg::Init {
+        sid: session_prefix(session_id),
+        token: token.to_string(),
+    };
+    path.send(envelope(PacketType::Control, session_id, init.encode()?))
+        .await?;
+
+    // Datagrams are unreliable; give the gateway a bounded window to reply.
+    let reply = match tokio::time::timeout(
+        Duration::from_secs(5),
+        path.recv(),
+    )
+    .await
+    .map_err(|_| {
+        Error::auth("bootstrap: gateway did not answer the session ticket within 5s")
+    })? {
+        Ok(e) if e.packet_type == PacketType::Control => e,
+        Ok(_) => return Err(Error::protocol("bootstrap: expected control reply")),
+        Err(e) => return Err(Error::transport(format!("bootstrap: {e}"))),
+    };
+    match sg_protocol::control::ControlMsg::decode(&reply.payload)
+        .map_err(|e| Error::protocol(format!("bootstrap: {e}")))?
+    {
+        ControlMsg::Ack { sid } => Ok(sg_core::SessionId::from_bytes(prefix_bytes(sid))),
+        ControlMsg::Nack { sid, reason } => Err(Error::auth(format!(
+            "gateway rejected session 0x{sid:08x}: {reason}"
+        ))),
+        other => Err(Error::protocol(format!("bootstrap: unexpected control {other:?}"))),
+    }
+}
+
+fn session_prefix(id: SessionId) -> u32 {
+    let b = id.as_guid().as_bytes();
+    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+}
+
+fn prefix_bytes(prefix: u32) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[0..4].copy_from_slice(&prefix.to_be_bytes());
+    b
+}
+
+fn envelope(packet_type: PacketType, session_id: SessionId, payload: Bytes) -> Envelope {
+    Envelope {
+        version: sg_protocol::VERSION,
+        packet_type,
+        flags: 0,
+        path_id: PathId::new(0),
+        session_id,
+        sequence: sg_core::Sequence::new(0),
+        timestamp_ms: 0,
+        payload,
+    }
+}
+
 /// A single encrypted path: envelopes in, envelopes out, over QUIC datagrams.
 pub struct QuicPathTransport {
     conn: quinn::Connection,
@@ -161,8 +229,9 @@ pub struct QuicSession {
 }
 
 impl QuicSession {
-    /// Opens the first path to the gateway. `token` is a placeholder in
-    /// this milestone; the real mTLS/JWT exchange fills it (spec 15.5).
+    /// Opens the first path to the gateway and runs the v1 bootstrap
+    /// handshake. `token` is the gateway-signed session ticket (spec 15.5).
+    /// Fails with `Error::Auth` if the gateway refuses the ticket.
     pub async fn connect(
         addr: SocketAddr,
         server_name: &str,
@@ -172,6 +241,13 @@ impl QuicSession {
         token: String,
     ) -> Result<Self> {
         let transport = connect_path(addr, server_name, config, path_id).await?;
+        // Verify the gateway accredits this session on the new path.
+        let accredited = bootstrap_v1(&transport, session, &token).await?;
+        if accredited != session {
+            return Err(Error::auth(format!(
+                "gateway accredited {accredited:?} for a different session than {session:?}"
+            )));
+        }
         let ticket = SessionTicket {
             session_id: session,
             token,

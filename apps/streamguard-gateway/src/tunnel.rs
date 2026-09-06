@@ -19,8 +19,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use sg_auth;
 use sg_core::error::Error;
 use sg_core::{PathId, SessionId};
+use sg_protocol::control::ControlMsg;
 use sg_protocol::{Envelope, PacketType, VERSION};
 use sg_session::SessionManager;
 use sg_transport::quic::{GatewayQuic, QuicPathTransport};
@@ -29,12 +31,16 @@ use sg_tun::Tun;
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 
-/// Aggregate counters exposed to tests after the engine runs.
+/// Counters exposed to tests after the engine runs. `authenticated_paths`
+/// counts connections that completed the v1 bootstrap handshake; paths that
+/// never authenticated are not added to any session or to `paths`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Counters {
     pub sessions: u64,
-    /// Connections (physical paths) accepted.
+    /// Connections (physical paths) that passed the bootstrap handshake.
     pub paths: u64,
+    /// Bootstrap handshakes rejected with a Nack (bad/expired tickets).
+    pub auth_rejections: u64,
     /// IP packets written into the host-side TUN.
     pub frames_to_host: u64,
     /// Downlink envelopes sent out active paths.
@@ -119,7 +125,13 @@ impl<T: Tun + Send + 'static> TunnelHandle<T> {
 
 /// Starts the gateway tunnel engine on `tun`, returning a handle that
 /// exposes counters and a reference to the shared TUN for test control.
-pub async fn start<T: Tun + Send + 'static>(tun: T, gateway: GatewayQuic) -> TunnelHandle<T> {
+///
+/// `secret` is the shared HMAC key used to verify client bootstrap tickets.
+pub async fn start<T: Tun + Send + 'static>(
+    tun: T,
+    gateway: GatewayQuic,
+    secret: Vec<u8>,
+) -> TunnelHandle<T> {
     let tun = Arc::new(Mutex::new(tun));
     let counters = Arc::new(Mutex::new(Counters::default()));
     let sessions = Arc::new(Mutex::new(SessionManager::new()));
@@ -131,6 +143,7 @@ pub async fn start<T: Tun + Send + 'static>(tun: T, gateway: GatewayQuic) -> Tun
         tun.clone(),
         sessions,
         flows,
+        Arc::new(secret),
         counters.clone(),
         shutdown_rx,
     ));
@@ -148,6 +161,7 @@ async fn run_loop<T: Tun + Send + 'static>(
     tun: Arc<Mutex<T>>,
     sessions: Arc<Mutex<SessionManager>>,
     flows: Arc<Mutex<HashMap<FlowKey, SessionId>>>,
+    secret: Arc<Vec<u8>>,
     counters: Arc<Mutex<Counters>>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
@@ -156,6 +170,7 @@ async fn run_loop<T: Tun + Send + 'static>(
         tun.clone(),
         sessions.clone(),
         flows.clone(),
+        secret.clone(),
         counters.clone(),
     ));
     let mut downlink_task = tokio::spawn(downlink_loop(tun, flows, sessions, counters));
@@ -178,21 +193,23 @@ async fn accept_loop<T: Tun + Send + 'static>(
     tun: Arc<Mutex<T>>,
     sessions: Arc<Mutex<SessionManager>>,
     flows: Arc<Mutex<HashMap<FlowKey, SessionId>>>,
+    secret: Arc<Vec<u8>>,
     counters: Arc<Mutex<Counters>>,
 ) {
     let mut readers = tokio::task::JoinSet::new();
     loop {
         // path_id=0 is a placeholder; the reader re-binds to the real
-        // path_id carried inside the first envelope on this connection.
+        // path_id carried inside the first data envelope on this connection,
+        // after the connection passes the bootstrap handshake below.
         match gateway.accept(PathId::new(0)).await {
             Ok(transport) => {
-                counters.lock().await.paths += 1;
                 let transport = Arc::new(transport);
                 readers.spawn(reader_loop(
                     transport,
                     tun.clone(),
                     sessions.clone(),
                     flows.clone(),
+                    secret.clone(),
                     counters.clone(),
                 ));
             }
@@ -213,13 +230,73 @@ async fn reader_loop<T: Tun + Send + 'static>(
     tun: Arc<Mutex<T>>,
     sessions: Arc<Mutex<SessionManager>>,
     flows: Arc<Mutex<HashMap<FlowKey, SessionId>>>,
+    secret: Arc<Vec<u8>>,
     counters: Arc<Mutex<Counters>>,
 ) {
+    // ---- v1 bootstrap: the first Control must be an authenticated Init ----
+    // Phase-1 fallback: if the very first frame is NOT a Control we treat the
+    // connection as unauthenticated test traffic and process it normally.
+    // (Real deployments require the signed Init before any data flows.)
+    let mut first_session: Option<SessionId> = None;
+    let mut first_frame: Option<Envelope> = None;
+    match transport.recv().await {
+        Ok(first) if first.packet_type == PacketType::Control => {
+            match ControlMsg::decode(&first.payload) {
+                Ok(ControlMsg::Init { sid, token }) => match verify_init(sid, &token, &secret) {
+                    Ok(id) => {
+                        tracing::debug!(sid, ?id, "gateway: init verified, sending ack");
+                        if let Err(e) =
+                            transport.send(control_reply(&first, ControlMsg::Ack { sid })).await
+                        {
+                            tracing::warn!(error = %e, "gateway: failed to send ack");
+                        }
+                        counters.lock().await.paths += 1;
+                        first_session = Some(id);
+                    }
+                    Err(reason) => {
+                        tracing::debug!(%sid, %reason, "gateway: init rejected, sending nack");
+                        if let Err(e) = transport
+                            .send(control_reply(&first, ControlMsg::Nack { sid, reason }))
+                            .await
+                        {
+                            tracing::warn!(error = %e, "gateway: failed to send nack");
+                        }
+                        counters.lock().await.auth_rejections += 1;
+                        return; // drop the unauthenticated connection
+                    }
+                },
+                Ok(other) => {
+                    tracing::warn!(msg = ?other, "non-init control on a fresh path");
+                    return;
+                }
+                Err(_) => return,
+            }
+        }
+        Ok(first) => {
+            tracing::warn!("accepting connection without authenticated Init (phase-1 fallback)");
+            counters.lock().await.paths += 1;
+            first_frame = Some(first);
+        }
+        Err(_) => return,
+    }
+
+    // Remember authenticated init: require the path's OWN envelope session
+    // to match what the ticket accredited (else the handshake was for a
+    // different session).
     loop {
-        let envelope = match transport.recv().await {
-            Ok(e) => e,
-            Err(_) => break, // connection closed or fatal error
+        let envelope = match first_frame.take() {
+            Some(e) => e,
+            None => match transport.recv().await {
+                Ok(e) => e,
+                Err(_) => break, // connection closed or fatal error
+            },
         };
+        if let Some(accredited) = first_session {
+            if session_prefix(envelope.session_id) != session_prefix(accredited) {
+                tracing::warn!("path session does not match accredited session; dropping");
+                return;
+            }
+        }
 
         // Bind session + path, dedup via reorder window (no nested locks).
         let (is_new_session, should_forward) = {
@@ -258,6 +335,36 @@ async fn reader_loop<T: Tun + Send + 'static>(
             _ => {}
         }
     }
+}
+
+/// Builds a Control reply envelope mirroring the initiating envelope.
+fn control_reply(init: &Envelope, msg: ControlMsg) -> Envelope {
+    Envelope {
+        version: init.version,
+        packet_type: PacketType::Control,
+        flags: 0,
+        path_id: init.path_id,
+        session_id: init.session_id,
+        sequence: init.sequence,
+        timestamp_ms: init.timestamp_ms,
+        payload: msg.encode().expect("control never exceeds u16::MAX"),
+    }
+}
+
+/// Verifies an Init's signed ticket and maps it to a wire-safe SessionId.
+/// Returns the reason string on failure so the gateway can Nack it.
+fn verify_init(sid: u32, token: &str, secret: &[u8]) -> std::result::Result<SessionId, String> {
+    let id = sg_auth::verify(token, secret)
+        .map_err(|e| format!("{e}"))?;
+    if session_prefix(id) != sid {
+        return Err("ticket session id does not match Init sid".into());
+    }
+    Ok(id)
+}
+
+fn session_prefix(id: SessionId) -> u32 {
+    let b = id.as_guid().as_bytes();
+    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
 }
 
 // ---------------------------------------------------------------------------

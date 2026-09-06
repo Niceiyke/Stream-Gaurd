@@ -86,13 +86,14 @@ async fn client_and_gateway_engines_talk_over_two_paths() {
     let addr = gateway.local_addr().unwrap();
 
     // Gateway engine on the host side.
+    let secret = b"e2e-test-secret".to_vec();
     let host_tun = LoopbackTun::with_config(TunConfig {
         name: "sg-wan0".into(),
         address: "192.168.1.1".into(),
         prefix_len: 24,
         mtu: 1300,
     });
-    let mut gw = tunnel::start(host_tun, gateway).await;
+    let mut gw = tunnel::start(host_tun, gateway, secret.clone()).await;
     let host_task = tokio::spawn(host_echo(gw.tun.clone()));
 
     // Client engine on the device side: one session, two paths.
@@ -103,6 +104,7 @@ async fn client_and_gateway_engines_talk_over_two_paths() {
         mtu: 1300,
     });
     let session = session_id_from_wire(0xfeedbeef);
+    let token = sg_auth::issue(&secret, session, 3600);
     let mut client = client::start(
         client_tun,
         addr,
@@ -110,14 +112,19 @@ async fn client_and_gateway_engines_talk_over_two_paths() {
         client_cfg,
         session,
         &[PathId::new(1), PathId::new(2)],
+        &token,
     )
     .await
     .unwrap();
     sleep(Duration::from_millis(150)).await;
 
-    // Both physical paths registered. The session itself is only learned
-    // once the first data envelope arrives (below).
-    assert_eq!(gw.counters().await.paths, 2, "both QUIC connections accepted");
+    // Both physical paths registered after successful bootstrap handshakes.
+    assert_eq!(
+        gw.counters().await.paths,
+        2,
+        "both QUIC connections accredited"
+    );
+    assert_eq!(gw.counters().await.auth_rejections, 0);
 
     // ---- round-trip 1 on the initial active path (path 1, unmetered) ----
     let req1 = icmp_request([10, 0, 85, 2], [8, 8, 8, 8], 0x1111);

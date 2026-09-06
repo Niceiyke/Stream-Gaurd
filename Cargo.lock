@@ -780,6 +780,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sg-auth"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "sg-core",
+]
+
+[[package]]
 name = "sg-core"
 version = "0.1.0"
 dependencies = [
@@ -926,7 +934,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "quinn",
  "rcgen",
+ "sg-auth",
  "sg-core",
  "sg-multipath",
  "sg-platform",
@@ -947,6 +957,7 @@ dependencies = [
  "bytes",
  "quinn",
  "rcgen",
+ "sg-auth",
  "sg-core",
  "sg-health",
  "sg-multipath",

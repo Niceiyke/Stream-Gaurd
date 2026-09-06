@@ -11,7 +11,7 @@ use sg_core::PathId;
 use sg_session::session_id_from_wire;
 use sg_protocol::{Envelope, PacketType, VERSION};
 use sg_transport::PathTransport;
-use sg_transport::quic::{GatewayQuic, client_tls, connect_path, server_tls};
+use sg_transport::quic::{GatewayQuic, bootstrap_v1, client_tls, connect_path, server_tls};
 use sg_tun::{LoopbackTun, TunConfig};
 use streamguard_gateway::tunnel::start;
 use tokio::time::{Duration, sleep};
@@ -58,27 +58,34 @@ async fn two_sessions_two_paths_share_one_gateway_tun() {
     let addr = gateway.local_addr().unwrap();
 
     // One gateway TUN for all sessions.
+    let secret = b"multisession-test-secret".to_vec();
     let host_tun = LoopbackTun::with_config(TunConfig {
         name: "sg-wan0".into(),
         address: "192.168.1.1".into(),
         prefix_len: 24,
         mtu: 1300,
     });
-    let mut handle = start(host_tun, gateway).await;
+    let mut handle = start(host_tun, gateway, secret.clone()).await;
 
-    // Two sessions, two paths each. The gateway accept loop runs
-    // concurrently inside the engine; bind all four client connections.
+    // Two sessions, two paths each. Every connection must bootstrap with the
+    // signed ticket for its session before it can carry data.
     let session_a = session_id_from_wire(0xa0a0a0a0);
     let session_b = session_id_from_wire(0xb0b0b0b0);
+    let token_a = sg_auth::issue(&secret, session_a, 60);
+    let token_b = sg_auth::issue(&secret, session_b, 60);
     let a1 = PathId::new(1);
     let a2 = PathId::new(2);
     let b1 = PathId::new(3);
     let b2 = PathId::new(4);
 
     let ca1 = connect_path(addr, "localhost", client_cfg.clone(), a1).await.unwrap();
+    bootstrap_v1(&ca1, session_a, &token_a).await.unwrap();
     let ca2 = connect_path(addr, "localhost", client_cfg.clone(), a2).await.unwrap();
+    bootstrap_v1(&ca2, session_a, &token_a).await.unwrap();
     let cb1 = connect_path(addr, "localhost", client_cfg.clone(), b1).await.unwrap();
+    bootstrap_v1(&cb1, session_b, &token_b).await.unwrap();
     let cb2 = connect_path(addr, "localhost", client_cfg.clone(), b2).await.unwrap();
+    bootstrap_v1(&cb2, session_b, &token_b).await.unwrap();
     sleep(Duration::from_millis(100)).await; // let the engine finish accepting/binding
     let _ = (&ca2, &cb2); // standby paths exist but are idle in phase 1
 
@@ -160,17 +167,20 @@ async fn uplink_rejects_on_wire_duplicate() {
     let gateway = GatewayQuic::bind("127.0.0.1:0".parse().unwrap(), server_cfg).unwrap();
     let addr = gateway.local_addr().unwrap();
 
+    let secret = b"duplicate-test-secret".to_vec();
     let host_tun = LoopbackTun::with_config(TunConfig {
         name: "sg-wan0".into(),
         address: "192.168.1.1".into(),
         prefix_len: 24,
         mtu: 1300,
     });
-    let mut handle = start(host_tun, gateway).await;
+    let mut handle = start(host_tun, gateway, secret.clone()).await;
 
     let session = session_id_from_wire(0xc0c0c0c0);
+    let token = sg_auth::issue(&secret, session, 60);
     let path = PathId::new(1);
     let client = connect_path(addr, "localhost", client_cfg, path).await.unwrap();
+    bootstrap_v1(&client, session, &token).await.unwrap();
     sleep(Duration::from_millis(100)).await;
 
     let pkt = icmp_request([10, 0, 85, 2], [8, 8, 8, 8], 0x3333);

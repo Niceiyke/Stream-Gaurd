@@ -30,4 +30,6 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
+sg-auth.workspace = true
+sg-core.workspace = true
 streamguard-gateway = { path = "../../apps/streamguard-gateway" }

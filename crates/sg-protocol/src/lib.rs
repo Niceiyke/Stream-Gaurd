@@ -5,6 +5,8 @@
 //! datagram so the scheduler and gateway can sequence, deduplicate and
 //! reorder packets that arrive over independent physical paths.
 
+pub mod control;
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use sg_core::{error::Error, PathId, Sequence, SessionId};
