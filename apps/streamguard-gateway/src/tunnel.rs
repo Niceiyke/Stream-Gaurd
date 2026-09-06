@@ -55,6 +55,9 @@ pub struct Counters {
     /// Paths removed from sessions because their QUIC connection died. The
     /// session falls back to a surviving path (see `Session::remove_path`).
     pub paths_evicted: u64,
+    /// Health probes answered with a `PathStatus` reply (per-path cadence
+    /// the client's liveness monitor keys on).
+    pub probes_replied: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -373,7 +376,25 @@ async fn reader_loop<T: Tun + Send + 'static>(
             PacketType::Keepalive => {
                 counters.lock().await.keepalives += 1;
             }
-            _ => {} // Probe / PathStatus are reserved for later milestones
+            // Per-path health probe (spec 31.3): bounce it straight back as a
+            // PathStatus so the client can measure RTT and treat silence as a
+            // soft-liveness failure (`probe_timeout` expiry).
+            PacketType::Probe => {
+                let status = Envelope {
+                    version: VERSION,
+                    packet_type: PacketType::PathStatus,
+                    flags: 0,
+                    path_id: envelope.path_id,
+                    session_id: envelope.session_id,
+                    sequence: envelope.sequence,
+                    timestamp_ms: envelope.timestamp_ms,
+                    payload: envelope.payload.clone(),
+                };
+                if transport.send(status).await.is_ok() {
+                    counters.lock().await.probes_replied += 1;
+                }
+            }
+            _ => {} // PathStatus / other are reserved for later milestones
         }
     }
 

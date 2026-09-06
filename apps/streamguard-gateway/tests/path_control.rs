@@ -143,3 +143,64 @@ async fn path_select_steers_downlink_to_the_new_active_path() {
 
     handle.stop().await;
 }
+
+/// Spec 31.3: the gateway answers a per-path health probe with a `PathStatus`
+/// reply echoing the probe id, so the client can measure RTT and detect a path
+/// that has gone silent (soft failure) even while its QUIC connection lives.
+#[tokio::test]
+async fn probe_gets_echoed_back_as_path_status() {
+    let (cert_der, key_der) = {
+        let c = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        (c.cert.der().to_vec(), c.key_pair.serialize_der())
+    };
+    let server_cfg = server_tls(&cert_der, &key_der).unwrap();
+    let client_cfg = client_tls(&cert_der).unwrap();
+    let gateway = GatewayQuic::bind("127.0.0.1:0".parse().unwrap(), server_cfg).unwrap();
+    let addr = gateway.local_addr().unwrap();
+
+    let secret = b"probe-test-secret".to_vec();
+    let host_tun = LoopbackTun::with_config(TunConfig {
+        name: "sg-wan0".into(),
+        address: "192.168.1.1".into(),
+        prefix_len: 24,
+        mtu: 1300,
+    });
+    let mut handle = start(host_tun, gateway, secret.clone()).await;
+
+    let session = session_id_from_wire(0xc0de1234);
+    let token = sg_auth::issue(&secret, session, 60);
+    let a1 = PathId::new(1);
+
+    let ca1 = connect_path(addr, "localhost", client_cfg.clone(), a1).await.unwrap();
+    bootstrap_v1(&ca1, session, &token).await.unwrap();
+    sleep(Duration::from_millis(100)).await; // accept + bind
+
+    let probe_id = 0x0000_0042u32;
+    ca1.send(Envelope {
+        version: VERSION,
+        packet_type: PacketType::Probe,
+        flags: 0,
+        path_id: a1,
+        session_id: session,
+        sequence: sg_core::Sequence::new(0),
+        timestamp_ms: 0,
+        payload: Bytes::copy_from_slice(&probe_id.to_be_bytes()),
+    })
+    .await
+    .unwrap();
+
+    let status = ca1
+        .recv()
+        .await
+        .expect("the probe is answered with a PathStatus");
+    assert_eq!(status.packet_type, PacketType::PathStatus);
+    assert_eq!(status.path_id, a1, "reply stays on the probed path");
+    assert_eq!(status.payload, Bytes::from(probe_id.to_be_bytes().to_vec()));
+    assert_eq!(
+        handle.counters().await.probes_replied,
+        1,
+        "one probe answered"
+    );
+
+    handle.stop().await;
+}

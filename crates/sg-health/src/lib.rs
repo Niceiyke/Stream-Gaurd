@@ -42,6 +42,38 @@ impl PathMetrics {
     pub fn is_eligible(&self) -> bool {
         self.reachable && self.loss < 0.20
     }
+
+    /// Records one completed probe observation (spec 31.3 / 13).
+    ///
+    /// `Some(rtt_ms)` success smooths the EWMA state (alpha 1/8 for srtt and
+    /// jitter), damps the loss estimate toward zero and marks the path
+    /// reachable. `None` (lost probe) ramps the loss estimate upward —
+    /// 0, .125, .234, .330, ... — crossing the 20% eligibility cliff after
+    /// two consecutive misses. Deciding exactly when loss/absence flips
+    /// `reachable` to false (the soft-failure trigger) is the caller's job.
+    pub fn record_probe(&mut self, rtt: Option<u32>) {
+        match rtt {
+            Some(r) => {
+                self.rtt_ms = r;
+                if self.srtt_ms == 0 {
+                    self.srtt_ms = r;
+                } else {
+                    self.srtt_ms = (7 * self.srtt_ms + r) / 8;
+                }
+                let deviation = r.abs_diff(self.srtt_ms);
+                self.jitter_ms = if self.jitter_ms == 0 {
+                    deviation
+                } else {
+                    (7 * self.jitter_ms + deviation) / 8
+                };
+                self.loss *= 0.875;
+                self.reachable = true;
+            }
+            None => {
+                self.loss = 1.0 - 0.875 * (1.0 - self.loss);
+            }
+        }
+    }
 }
 
 /// Produces a score from `PathMetrics`.
@@ -100,6 +132,44 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(DefaultScorer::default().score(&m), 0.0);
+    }
+
+    #[test]
+    fn probe_observations_shape_the_metrics() {
+        let mut m = PathMetrics::default();
+        assert!(!m.reachable);
+        m.record_probe(Some(20));
+        assert!(m.reachable);
+        assert_eq!(m.rtt_ms, 20);
+        assert_eq!(m.srtt_ms, 20);
+
+        m.record_probe(Some(28));
+        assert_eq!(m.srtt_ms, 21, "(7*20+28)/8 = 21");
+
+        // Lossless path: repeated successes pull loss near zero.
+        for _ in 0..8 {
+            m.record_probe(Some(25));
+        }
+        assert!(m.loss < 0.20, "a healthy path stays eligible");
+        assert!(m.is_eligible());
+    }
+
+    #[test]
+    fn lost_probes_ramp_loss_toward_the_eligibility_cliff() {
+        let mut m = PathMetrics {
+            reachable: true,
+            ..Default::default()
+        };
+        m.record_probe(None);
+        assert_eq!(m.loss, 0.125);
+        m.record_probe(None);
+        assert_eq!(m.loss, 0.234375);
+        assert!(
+            m.loss >= 0.20,
+            "two consecutive misses cross the 20% eligibility cliff"
+        );
+        m.record_probe(None);
+        assert!(m.loss > 0.30, "loss keeps ramping on further misses");
     }
 
     #[test]
