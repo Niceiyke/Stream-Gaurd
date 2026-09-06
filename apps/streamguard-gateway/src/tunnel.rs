@@ -313,8 +313,8 @@ async fn reader_loop<T: Tun + Send + 'static>(
             }
         }
 
-        // Bind session + path, dedup via reorder window (no nested locks).
-        let (is_new_session, should_forward) = {
+        // Bind session + path, dedup + reorder inbound data (no nested locks).
+        let (is_new_session, outcome) = {
             let mut sessions = sessions.lock().await;
             let session = sessions.get_or_create(envelope.session_id);
             let is_new = session.path_count() == 0;
@@ -323,31 +323,35 @@ async fn reader_loop<T: Tun + Send + 'static>(
             {
                 binds.push((envelope.session_id, envelope.path_id));
             }
-            let accept = match envelope.packet_type {
+            let outcome = match envelope.packet_type {
                 PacketType::Data | PacketType::Duplicate => {
-                    session.accept_incoming(envelope.sequence)
+                    session.enqueue_incoming(envelope.sequence, envelope.payload.clone())
                 }
-                _ => false, // Control / Keepalive / Probe / PathStatus
+                _ => sg_multipath::ReorderOutcome::default(), // Control etc. bypass
             };
-            (is_new, accept)
+            (is_new, outcome)
         };
         if is_new_session {
             counters.lock().await.sessions += 1;
         }
         match envelope.packet_type {
-            PacketType::Data | PacketType::Duplicate if should_forward => {
-                counters.lock().await.frames_to_host += 1;
-                // Learn the flow so the reply can be routed back to this
-                // session (reverse-key lookup in the downlink loop).
-                let sid = envelope.session_id;
-                if let Some(key) = parse_flow(&envelope.payload) {
-                    flows.lock().await.insert(key, sid);
-                }
-                let mut t = tun.lock().await;
-                let _ = t.write(&envelope.payload);
-            }
+            // Spec 11.2: payloads are injected into the TUN in sequence order.
+            // A single arrival can release several payloads once a gap fills.
             PacketType::Data | PacketType::Duplicate => {
-                counters.lock().await.duplicates_dropped += 1;
+                for (_, payload) in outcome.delivered {
+                    counters.lock().await.frames_to_host += 1;
+                    // Learn the flow so the reply can be routed back to this
+                    // session (reverse-key lookup in the downlink loop).
+                    let sid = envelope.session_id;
+                    if let Some(key) = parse_flow(&payload) {
+                        flows.lock().await.insert(key, sid);
+                    }
+                    let mut t = tun.lock().await;
+                    let _ = t.write(&payload);
+                }
+                if outcome.dropped {
+                    counters.lock().await.duplicates_dropped += 1;
+                }
             }
             // Rev1 path control: the client picked a new active path; move the
             // downlink for its session there (fire-and-forget datagram).

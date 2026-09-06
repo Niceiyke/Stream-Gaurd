@@ -808,6 +808,7 @@ dependencies = [
 name = "sg-multipath"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "sg-core",
  "sg-health",
  "sg-protocol",

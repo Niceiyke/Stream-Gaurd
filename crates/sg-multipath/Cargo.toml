@@ -10,3 +10,4 @@ description = "StreamGuard scheduling, failover, redundancy, sequencing, dedupli
 sg-core.workspace = true
 sg-health.workspace = true
 sg-protocol.workspace = true
+bytes.workspace = true

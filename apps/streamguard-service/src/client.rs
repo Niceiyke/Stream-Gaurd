@@ -326,20 +326,26 @@ async fn reader_loop<T: Tun + Send + 'static>(
                 break;
             }
         };
-        match envelope.packet_type {
-            // Dedup against the shared per-session window, then inject.
+match envelope.packet_type {
+            // Dedup + reorder against the shared per-session window, then
+            // inject any payloads that became in-order (spec 11.2).
             PacketType::Data | PacketType::Duplicate => {
-                let is_new = {
-                    let mut sess = shared.session.lock().await;
-                    sess.accept_incoming(envelope.sequence)
-                };
-                if envelope.packet_type == PacketType::Duplicate || !is_new {
+                if envelope.packet_type == PacketType::Duplicate {
                     counters.lock().await.duplicates_dropped += 1;
                     continue;
                 }
-                counters.lock().await.frames_to_host += 1;
-                let mut t = tun.lock().await;
-                let _ = t.write(&envelope.payload);
+                let outcome = {
+                    let mut sess = shared.session.lock().await;
+                    sess.enqueue_incoming(envelope.sequence, envelope.payload.clone())
+                };
+                if outcome.dropped {
+                    counters.lock().await.duplicates_dropped += 1;
+                }
+                for (_, payload) in outcome.delivered {
+                    counters.lock().await.frames_to_host += 1;
+                    let mut t = tun.lock().await;
+                    let _ = t.write(&payload);
+                }
             }
             // A probe reply is a clean RTT observation for this path: resolve the
             // outstanding probe, feed the health engine and clear the
@@ -783,7 +789,6 @@ fn choose_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sg_core::Sequence;
     use sg_transport::quic::{GatewayQuic, client_tls, server_tls};
     use sg_tun::LoopbackTun;
     use sg_tun::TunConfig;
@@ -886,8 +891,8 @@ mod tests {
                             packet_type: PacketType::Control,
                             flags: 0,
                             path_id: e.path_id,
-                            session_id: e.session_id,
-                            sequence: Sequence::new(e.sequence.get().wrapping_add(1_000_000)),
+session_id: e.session_id,
+                            sequence: e.sequence,
                             timestamp_ms: e.timestamp_ms,
                             payload: sg_protocol::control::ControlMsg::Ack { sid }
                                 .encode()
@@ -900,7 +905,7 @@ mod tests {
                         flags: 0,
                         path_id: e.path_id,
                         session_id: e.session_id,
-                        sequence: Sequence::new(e.sequence.get().wrapping_add(1_000_000)),
+                        sequence: e.sequence,
                         timestamp_ms: e.timestamp_ms,
                         payload: e.payload.clone(),
                     },
@@ -984,10 +989,8 @@ mod tests {
                                     packet_type: PacketType::Control,
                                     flags: 0,
                                     path_id: e.path_id,
-                                    session_id: e.session_id,
-                                    sequence: Sequence::new(
-                                        e.sequence.get().wrapping_add(1_000_000),
-                                    ),
+session_id: e.session_id,
+                                    sequence: e.sequence,
                                     timestamp_ms: e.timestamp_ms,
                                     payload: sg_protocol::control::ControlMsg::Ack { sid }
                                         .encode()
@@ -1000,7 +1003,7 @@ mod tests {
                                 flags: 0,
                                 path_id: e.path_id,
                                 session_id: e.session_id,
-                                sequence: Sequence::new(e.sequence.get().wrapping_add(1_000_000)),
+                                sequence: e.sequence,
                                 timestamp_ms: e.timestamp_ms,
                                 payload: e.payload.clone(),
                             },

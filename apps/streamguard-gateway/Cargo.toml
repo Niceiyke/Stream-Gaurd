@@ -15,6 +15,7 @@ anyhow.workspace = true
 bytes.workspace = true
 sg-auth.workspace = true
 sg-core.workspace = true
+sg-multipath.workspace = true
 sg-platform.workspace = true
 sg-protocol.workspace = true
 sg-session.workspace = true

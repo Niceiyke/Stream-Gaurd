@@ -14,9 +14,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use sg_core::error::{Error, Result};
 use sg_core::{PathId, Sequence, SessionId};
-use sg_multipath::{ReorderWindow, Sequencer, default_reorder_window};
+use sg_multipath::{ReorderBuffer, Sequencer};
 use sg_protocol::Envelope;
 use sg_transport::PathTransport;
 
@@ -36,7 +37,7 @@ pub fn session_id_from_wire(prefix: u32) -> SessionId {
 pub struct Session {
     session_id: SessionId,
     out_seq: Sequencer,
-    in_window: ReorderWindow,
+    reorder: ReorderBuffer,
     paths: HashMap<PathId, Arc<dyn PathTransport>>,
     active_path: Option<PathId>,
 }
@@ -46,7 +47,7 @@ impl Session {
         Self {
             session_id,
             out_seq: Sequencer::new(),
-            in_window: default_reorder_window(),
+            reorder: ReorderBuffer::new(128),
             paths: HashMap::new(),
             active_path: None,
         }
@@ -118,9 +119,19 @@ impl Session {
         self.out_seq.next_sequence()
     }
 
-    /// True when `seq` is new (non-duplicate) and may be passed up.
-    pub fn accept_incoming(&mut self, seq: Sequence) -> bool {
-        self.in_window.accept(seq)
+    /// Feeds one inbound (sequence, payload) into the session's reorder
+    /// buffer; returns the payloads that became deliverable in sequence
+    /// order (spec 11.2: the gateway reorders before injection into TUN).
+    pub fn enqueue_incoming(
+        &mut self,
+        seq: Sequence,
+        payload: Bytes,
+    ) -> sg_multipath::ReorderOutcome {
+        self.reorder.deliver(seq, payload)
+    }
+
+    pub fn pending_incoming(&self) -> usize {
+        self.reorder.pending()
     }
 
     /// Sends an envelope out the currently active path.
@@ -213,12 +224,21 @@ mod tests {
     }
 
     #[test]
-    fn session_sequences_and_dedups() {
+    fn session_sequences_and_reorders_inbound() {
         let mut session = Session::new(session_id_from_wire(1));
         assert_eq!(session.next_sequence(), Sequence::new(0));
         assert_eq!(session.next_sequence(), Sequence::new(1));
-        assert!(session.accept_incoming(Sequence::new(5)));
-        assert!(!session.accept_incoming(Sequence::new(5)), "duplicate rejected");
+
+        let out = session.enqueue_incoming(Sequence::new(5), Bytes::from_static(b"five"));
+        assert!(out.buffered, "out-of-order seq held awaiting seq0..4");
+        assert!(out.delivered.is_empty());
+        assert_eq!(session.pending_incoming(), 1);
+
+        let dup = session.enqueue_incoming(Sequence::new(5), Bytes::from_static(b"five-bis"));
+        assert!(dup.dropped, "duplicate rejected");
+
+        let o = session.enqueue_incoming(Sequence::new(0), Bytes::from_static(b"zero"));
+        assert_eq!(o.delivered.len(), 1, "only seq0 is contiguous yet");
     }
 
     #[test]

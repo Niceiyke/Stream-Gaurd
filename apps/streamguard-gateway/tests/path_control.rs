@@ -178,7 +178,7 @@ async fn duplicate_seq_is_deduplicated_at_the_gateway() {
     bootstrap_v1(&ca2, session, &token).await.unwrap();
     sleep(Duration::from_millis(100)).await; // accept + bind
 
-    let seq = sg_core::Sequence::new(77);
+    let seq = sg_core::Sequence::new(0);
     let payload = Bytes::from(icmp_request([10, 0, 85, 2], [8, 8, 8, 8], 0x2222));
     ca1.send(Envelope {
         version: VERSION,
@@ -214,6 +214,93 @@ async fn duplicate_seq_is_deduplicated_at_the_gateway() {
         c.duplicates_dropped, 1,
         "the second copy is rejected by the reorder window"
     );
+
+    handle.stop().await;
+}
+
+/// Spec 11.2/11.3: the gateway reorders by `sequence_number` before injection
+/// into TUN, holding out-of-order arrivals until the gap fills and then
+/// releasing the contiguous chain in order.
+#[tokio::test]
+async fn gateway_injects_frames_to_host_in_sequence_order() {
+    let (cert_der, key_der) = {
+        let c = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        (c.cert.der().to_vec(), c.key_pair.serialize_der())
+    };
+    let server_cfg = server_tls(&cert_der, &key_der).unwrap();
+    let client_cfg = client_tls(&cert_der).unwrap();
+    let gateway = GatewayQuic::bind("127.0.0.1:0".parse().unwrap(), server_cfg).unwrap();
+    let addr = gateway.local_addr().unwrap();
+
+    let secret = b"reorder-test-secret".to_vec();
+    let host_tun = LoopbackTun::with_config(TunConfig {
+        name: "sg-wan0".into(),
+        address: "192.168.1.1".into(),
+        prefix_len: 24,
+        mtu: 1300,
+    });
+    let mut handle = start(host_tun, gateway, secret.clone()).await;
+
+    let session = session_id_from_wire(0x44a1a2a3);
+    let token = sg_auth::issue(&secret, session, 60);
+    let a1 = PathId::new(1);
+    let a2 = PathId::new(2);
+
+    let ca1 = connect_path(addr, "localhost", client_cfg.clone(), a1).await.unwrap();
+    bootstrap_v1(&ca1, session, &token).await.unwrap();
+    let ca2 = connect_path(addr, "localhost", client_cfg.clone(), a2).await.unwrap();
+    bootstrap_v1(&ca2, session, &token).await.unwrap();
+    sleep(Duration::from_millis(100)).await; // accept + bind
+
+    let zero = icmp_request([10, 0, 85, 2], [8, 8, 8, 8], 0x0a01);
+    let one = icmp_request([10, 0, 85, 2], [8, 8, 8, 8], 0x0a02);
+
+    // seq 1 arrives first and is held: the gap (seq 0) never reached TUN.
+    ca1.send(Envelope {
+        version: VERSION,
+        packet_type: PacketType::Data,
+        flags: 0,
+        path_id: a1,
+        session_id: session,
+        sequence: sg_core::Sequence::new(1),
+        timestamp_ms: 0,
+        payload: Bytes::copy_from_slice(&one),
+    })
+    .await
+    .unwrap();
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        handle.counters().await.frames_to_host,
+        0,
+        "out-of-order seq 1 held until the gap fills"
+    );
+
+    // seq 0 arrives over the other path: both release, in sequence order.
+    ca2.send(Envelope {
+        version: VERSION,
+        packet_type: PacketType::Data,
+        flags: 0,
+        path_id: a2,
+        session_id: session,
+        sequence: sg_core::Sequence::new(0),
+        timestamp_ms: 0,
+        payload: Bytes::copy_from_slice(&zero),
+    })
+    .await
+    .unwrap();
+    sleep(Duration::from_millis(100)).await;
+
+    let c = handle.counters().await;
+    assert_eq!(c.frames_to_host, 2, "gap fill releases the contiguous chain");
+    assert_eq!(c.duplicates_dropped, 0);
+
+    let drained = handle.tun.lock().await.drain_outbound();
+    assert_eq!(drained.len(), 2, "both payloads injected into TUN");
+    assert_eq!(
+        drained[0], Bytes::from(zero),
+        "seq 0 hits the TUN before the earlier-arrived seq 1"
+    );
+    assert_eq!(drained[1], Bytes::from(one));
 
     handle.stop().await;
 }
