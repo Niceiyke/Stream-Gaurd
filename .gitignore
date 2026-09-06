@@ -12,3 +12,8 @@ Desktop.ini
 *.crt
 *.key
 !testdata/**/*.pem
+
+# Third-party runtime DLLs/archives (Wintun, etc.) — never commit binaries.
+wintun-*.zip
+vendor/wintun/
+*.dll
