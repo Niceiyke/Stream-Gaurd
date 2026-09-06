@@ -944,12 +944,17 @@ name = "streamguard-service"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
+ "quinn",
+ "rcgen",
  "sg-core",
  "sg-health",
  "sg-multipath",
  "sg-network",
  "sg-platform",
+ "sg-protocol",
  "sg-routing",
+ "sg-session",
  "sg-transport",
  "sg-tun",
  "tokio",
