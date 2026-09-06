@@ -9,10 +9,9 @@
 //!
 //! The engine reads one IP packet per `read()` and writes one IP packet
 //! per `write()`; the opaque `Tun` hides the platform adapter. The real
-//! tun-rs backend is compiled only with the `native-tun` feature — it is
-//! off by default because tun-rs's Windows `build.rs` shells out to
-//! `cargo metadata`, which breaks on some toolchains (see the gateway
-//! milestone).
+//! tun-rs (v2) backend is compiled only with the `native-tun` feature:
+//! it is off by default so the scaffold builds and tests on any host
+//! without drivers (see the gateway and Windows milestones).
 
 use bytes::Bytes;
 use sg_core::error::{Error, Result};
@@ -95,44 +94,48 @@ pub fn create(cfg: &TunConfig) -> Result<Box<dyn Tun>> {
     }
 }
 
-/// Real tun-rs adapter (Wintun on Windows, /dev/net/tun on Linux,
-/// utun on macOS).
+/// Real tun-rs (v2) adapter: Wintun on Windows, /dev/net/tun on Linux,
+/// utun on macOS. Loads `wintun.dll` at runtime on Windows (configurable
+/// via `WINTUN_DLL`), so it compiles without embedding any DLL.
 #[cfg(feature = "native-tun")]
 mod platform {
-    use std::io::{Read as _, Write as _};
-
     use super::*;
 
     pub struct PlatformTun {
-        device: tun::Device,
+        device: tun_rs::SyncDevice,
         name: String,
         mtu: u32,
     }
 
     impl PlatformTun {
         pub fn create(cfg: &TunConfig) -> Result<Self> {
-            let mut config = tun::Configuration::default();
-            config.address(cfg.address.as_str());
-            config.netmask(netmask_str(cfg.prefix_len).as_str());
-            config.mtu(cfg.mtu as u16);
-            config.tun_name(cfg.name.as_str());
-            config.up();
-            let device = tun::create(&config).map_err(|e| Error::io(e.to_string()))?;
-            let name = device
-                .tun_name()
-                .unwrap_or_else(|_| cfg.name.clone());
-            let mtu = device.mtu().unwrap_or(cfg.mtu as u16) as u32;
-            Ok(Self { device, name, mtu })
+            let mut builder = tun_rs::DeviceBuilder::new();
+            builder = builder.name(cfg.name.clone());
+            builder = builder.ipv4(cfg.address.as_str(), cfg.prefix_len, None);
+            builder = builder.mtu(cfg.mtu as u16);
+            #[cfg(target_os = "windows")]
+            {
+                builder = builder.ring_capacity(0x20_0000);
+                builder = builder.wintun_file(
+                    std::env::var("WINTUN_DLL").unwrap_or_else(|_| "wintun.dll".into()),
+                );
+            }
+            let device = builder.build_sync().map_err(|e| Error::io(e.to_string()))?;
+            Ok(Self {
+                device,
+                name: cfg.name.clone(),
+                mtu: cfg.mtu,
+            })
         }
     }
 
     impl Tun for PlatformTun {
         fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-            self.device.read(buf).map_err(Error::from)
+            self.device.recv(buf).map_err(Error::from)
         }
 
         fn write(&mut self, packet: &[u8]) -> Result<usize> {
-            self.device.write(packet).map_err(Error::from)
+            self.device.send(packet).map_err(Error::from)
         }
 
         fn name(&self) -> &str {

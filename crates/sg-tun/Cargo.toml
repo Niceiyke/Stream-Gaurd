@@ -8,13 +8,13 @@ description = "StreamGuard cross-platform virtual NIC abstraction"
 
 [features]
 default = []
-# Enables the real tun-rs (crates.io `tun`) platform backend: Wintun on
-# Windows, /dev/net/tun on Linux, utun on macOS. Off by default because
-# tun-rs's Windows build.rs shells out to `cargo metadata` (fails on some
-# toolchains); enable on the target box when the platform milestone lands.
-native-tun = ["dep:tun"]
+# Enables the real `tun-rs` (v2) platform backend: Wintun on Windows,
+# /dev/net/tun on Linux, utun on macOS. Off by default so the scaffold
+# compiles anywhere without drivers; enable on the target box and place
+# `wintun.dll` next to the binary (or set `WINTUN_DLL`) on Windows.
+native-tun = ["dep:tun-rs"]
 
 [dependencies]
 bytes.workspace = true
 sg-core.workspace = true
-tun = { workspace = true, optional = true }
+tun-rs = { workspace = true, optional = true }
