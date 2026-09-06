@@ -144,6 +144,80 @@ async fn path_select_steers_downlink_to_the_new_active_path() {
     handle.stop().await;
 }
 
+/// Spec 11.2 / 12: a `Duplicate` envelope carries the same sequence as an
+/// earlier `Data` (phase 2 adaptive redundancy), and the gateway's reorder
+/// window delivers only the first copy up the stack.
+#[tokio::test]
+async fn duplicate_seq_is_deduplicated_at_the_gateway() {
+    let (cert_der, key_der) = {
+        let c = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        (c.cert.der().to_vec(), c.key_pair.serialize_der())
+    };
+    let server_cfg = server_tls(&cert_der, &key_der).unwrap();
+    let client_cfg = client_tls(&cert_der).unwrap();
+    let gateway = GatewayQuic::bind("127.0.0.1:0".parse().unwrap(), server_cfg).unwrap();
+    let addr = gateway.local_addr().unwrap();
+
+    let secret = b"dedup-test-secret".to_vec();
+    let host_tun = LoopbackTun::with_config(TunConfig {
+        name: "sg-wan0".into(),
+        address: "192.168.1.1".into(),
+        prefix_len: 24,
+        mtu: 1300,
+    });
+    let mut handle = start(host_tun, gateway, secret.clone()).await;
+
+    let session = session_id_from_wire(0xd0dd12ab);
+    let token = sg_auth::issue(&secret, session, 60);
+    let a1 = PathId::new(1);
+    let a2 = PathId::new(2);
+
+    let ca1 = connect_path(addr, "localhost", client_cfg.clone(), a1).await.unwrap();
+    bootstrap_v1(&ca1, session, &token).await.unwrap();
+    let ca2 = connect_path(addr, "localhost", client_cfg.clone(), a2).await.unwrap();
+    bootstrap_v1(&ca2, session, &token).await.unwrap();
+    sleep(Duration::from_millis(100)).await; // accept + bind
+
+    let seq = sg_core::Sequence::new(77);
+    let payload = Bytes::from(icmp_request([10, 0, 85, 2], [8, 8, 8, 8], 0x2222));
+    ca1.send(Envelope {
+        version: VERSION,
+        packet_type: PacketType::Data,
+        flags: 0,
+        path_id: a1,
+        session_id: session,
+        sequence: seq,
+        timestamp_ms: 0,
+        payload: payload.clone(),
+    })
+    .await
+    .unwrap();
+    // The redundant copy arrives on the other path with the same sequence;
+    // whichever arrives first wins and the second is dropped.
+    ca2.send(Envelope {
+        version: VERSION,
+        packet_type: PacketType::Duplicate,
+        flags: 0,
+        path_id: a2,
+        session_id: session,
+        sequence: seq,
+        timestamp_ms: 0,
+        payload,
+    })
+    .await
+    .unwrap();
+    sleep(Duration::from_millis(100)).await; // let both readers run
+
+    let c = handle.counters().await;
+    assert_eq!(c.frames_to_host, 1, "only the first copy reaches the host");
+    assert_eq!(
+        c.duplicates_dropped, 1,
+        "the second copy is rejected by the reorder window"
+    );
+
+    handle.stop().await;
+}
+
 /// Spec 31.3: the gateway answers a per-path health probe with a `PathStatus`
 /// reply echoing the probe id, so the client can measure RTT and detect a path
 /// that has gone silent (soft failure) even while its QUIC connection lives.

@@ -55,6 +55,9 @@ struct Shared {
     /// Consecutive probes lost on each path; crossing the failure threshold
     /// marks the path unreachable — soft failure (spec 12 / 13 / 31.3).
     probe_misses: Mutex<HashMap<PathId, u32>>,
+    /// Loss threshold above which the uplink duplicates a packet onto a
+    /// redundant path (phase 2 adaptive redundancy, spec 12).
+    redundancy_loss_threshold: f32,
 }
 
 /// Aggregate counters exposed to tests after the engine runs.
@@ -77,8 +80,11 @@ pub struct Counters {
     /// Paths marked unreachable by the soft-liveness monitor (no inbound
     /// envelope within `probe_timeout`), then failed over.
     pub soft_failures: u64,
-    /// Per-path health probes sent (each awaits a `PathStatus` reply).
+/// Per-path health probes sent (each awaits a `PathStatus` reply).
     pub probes_sent: u64,
+    /// Uplink `Duplicate` copies sent when the selected path was degraded
+    /// (phase 2 adaptive redundancy, spec 12).
+    pub duplicates_sent: u64,
 }
 
 /// A running client engine. Call `stop` to tear it down.
@@ -162,6 +168,12 @@ pub struct ClientOptions {
     /// Consecutive lost probes before a path is declared unreachable (soft
     /// failure) and failed over. Defaults to 2.
     pub probe_failure_threshold: u32,
+    /// Loss estimate at or above which a selected path is considered
+    /// degraded and its packets are duplicated (phase 2 adaptive redundancy,
+    /// spec 12): `Decision::Duplicate` sends a `Duplicate` copy of the same
+    /// sequence on a second healthy path, and the gateway's reorder window
+    /// keeps the first copy. `0.0` disables duplication. Defaults to 0.10.
+    pub redundancy_loss_threshold: f32,
 }
 
 /// Opens one QUIC path to the gateway per entry, authenticates each with the
@@ -209,6 +221,7 @@ pub async fn start<T: Tun + Send + 'static>(
         notified: Mutex::new(initial_active),
         pending_probes: Mutex::new(HashMap::new()),
         probe_misses: Mutex::new(HashMap::new()),
+        redundancy_loss_threshold: options.redundancy_loss_threshold,
     });
 
     // Spawn one downlink reader per bound path, one keepalive task if a
@@ -625,7 +638,11 @@ async fn uplink_loop<T: Tun + Send + 'static>(
             }
         };
 
-        // Sequence + pick the healthiest eligible path, then send.
+        // Sequence + pick the healthiest eligible path, then send. If the
+        // selected path is degraded (loss >= redundancy threshold, phase 2
+        // adaptive redundancy, spec 12), a `Duplicate` copy of the same
+        // sequence also goes out on a second healthy path; the gateway reorder
+        // window keeps the first copy to arrive (first-valid-wins).
         let (seq, path_id, session_id) = {
             let mut sess = shared.session.lock().await;
             let seq = sess.next_sequence();
@@ -663,6 +680,44 @@ async fn uplink_loop<T: Tun + Send + 'static>(
             .send_on(path_id, env)
             .await;
         counters.lock().await.datagrams_to_gateway += 1;
+
+        // Redundant copy: pick the best *other* healthy path and mirror the
+        // same sequence as a `Duplicate` so a lossy active path does not cost
+        // us the packet (spec 12 adaptive redundancy). Acquisition order
+        // honours the session→metrics convention: never hold one while taking
+        // the other.
+        let degraded = {
+            let metrics = shared.metrics.lock().await;
+            metrics.get(&path_id).is_some_and(|m| m.loss >= shared.redundancy_loss_threshold)
+                && shared.redundancy_loss_threshold != 0.0
+        };
+        if degraded {
+            let alt = {
+                let sess = shared.session.lock().await;
+                let metrics = shared.metrics.lock().await;
+                let mut ordered: Vec<PathId> =
+                    sess.path_ids().filter(|p| *p != path_id).collect();
+                ordered.sort_by_key(|p| p.get());
+                ordered.into_iter().find(|p| {
+                    metrics.get(p).is_some_and(|m| m.is_eligible())
+                })
+            };
+            if let Some(alt) = alt {
+                let dup = Envelope {
+                    version: VERSION,
+                    packet_type: PacketType::Duplicate,
+                    flags: 0,
+                    path_id: alt,
+                    session_id,
+                    sequence: seq,
+                    timestamp_ms: 0,
+                    payload: Bytes::copy_from_slice(&buf[..n]),
+};
+                let _ = shared.session.lock().await.send_on(alt, dup).await;
+                counters.lock().await.datagrams_to_gateway += 1;
+                counters.lock().await.duplicates_sent += 1;
+            }
+        }
     }
 }
 
@@ -866,6 +921,7 @@ mod tests {
                 probe_interval: Duration::from_secs(3600),
                 probe_timeout: Duration::from_secs(3600),
                 probe_failure_threshold: 2,
+                redundancy_loss_threshold: 0.0,
             },
             session_id,
             &[PathId::new(1)],
@@ -995,6 +1051,7 @@ mod tests {
                 probe_interval: Duration::from_millis(25),
                 probe_timeout: Duration::from_millis(50),
                 probe_failure_threshold: 4,
+                redundancy_loss_threshold: 0.0,
             },
             session_id,
             &[PathId::new(1), PathId::new(2)],
@@ -1027,7 +1084,7 @@ mod tests {
         handle.stop().await;
     }
 
-    #[tokio::test]
+#[tokio::test]
     async fn a_silent_path_fails_over_softly() {
         let (cert_der, key_der) = {
             let c = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -1055,6 +1112,7 @@ mod tests {
                 probe_interval: Duration::from_millis(30),
                 probe_timeout: Duration::from_millis(50),
                 probe_failure_threshold: 2,
+                redundancy_loss_threshold: 0.0,
             },
             session_id,
             &[PathId::new(1), PathId::new(2)],
@@ -1075,11 +1133,94 @@ mod tests {
             Some(PathId::new(2)),
             "the healthy standby takes over the downlink"
         );
-        let m1 = handle.path_metrics(PathId::new(1)).await;
+let m1 = handle.path_metrics(PathId::new(1)).await;
         assert_eq!(
             m1.map(|m| m.reachable),
             Some(false),
             "the silent path is marked unreachable"
+        );
+
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_degraded_path_duplicates_to_the_healthy_standby() {
+        let (cert_der, key_der) = {
+            let c = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            (c.cert.der().to_vec(), c.key_pair.serialize_der())
+        };
+        let server_cfg = server_tls(&cert_der, &key_der).unwrap();
+        let client_cfg = client_tls(&cert_der).unwrap();
+        let gateway = GatewayQuic::bind("127.0.0.1:0".parse().unwrap(), server_cfg).unwrap();
+        let addr = gateway.local_addr().unwrap();
+        let _echo = spawn_echo_gateway(gateway, vec![PathId::new(1), PathId::new(2)], HashSet::new());
+
+        // Phase 2 adaptive redundancy: the chosen active path is degraded (its loss
+        // estimate crossed `redundancy_loss_threshold`) but still eligible, so
+        // every packet is also sent as a `Duplicate` on the other eligible
+        // path. Both links are degraded here so neither steals the downlink.
+        let threshold = 0.10f32;
+        let mut handle = start(
+            LoopbackTun::with_config(TunConfig::default()),
+            ClientOptions {
+                addr,
+                server_name: "localhost".into(),
+                client_config: client_cfg,
+                keepalive_interval: Duration::from_secs(3600),
+                probe_interval: Duration::from_secs(3600),
+                probe_timeout: Duration::from_secs(3600),
+                probe_failure_threshold: 2,
+                redundancy_loss_threshold: threshold,
+            },
+            sg_session::session_id_from_wire(0x61616161),
+            &[PathId::new(1), PathId::new(2)],
+            "duplication-test-ticket",
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Path 1 (active) is degraded the most; path 2 is eligible but also
+        // degraded — the packet is still duplicated onto it as a safety net.
+        handle
+            .set_metrics(
+                PathId::new(1),
+                PathMetrics {
+                    reachable: true,
+                    srtt_ms: 20,
+                    loss: 0.12,
+                    available_kbps: 50_000,
+                    ..Default::default()
+                },
+            )
+            .await;
+        handle
+            .set_metrics(
+                PathId::new(2),
+                PathMetrics {
+                    reachable: true,
+                    srtt_ms: 15,
+                    loss: 0.15,
+                    available_kbps: 50_000,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        let up = fake_packet([10, 0, 85, 2], [8, 8, 8, 8]);
+        handle.tun.lock().await.enqueue(Bytes::from(up.clone()));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let cc = handle.counters().await;
+        assert_eq!(cc.datagrams_to_gateway, 2, "data + duplicate leave the client");
+        assert_eq!(cc.duplicates_sent, 1, "one redundant copy for the degraded path");
+
+        // The selected (least-degraded) path stays active: duplication is
+        // reactive, not a re-rank.
+        assert_eq!(
+            handle.active_path().await,
+            Some(PathId::new(1)),
+            "the least-bad eligible path is chosen and stays active"
         );
 
         handle.stop().await;
