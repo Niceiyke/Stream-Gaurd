@@ -15,7 +15,7 @@ anyhow.workspace = true
 sg-core.workspace = true
 sg-platform.workspace = true
 sg-protocol.workspace = true
-sg-transport.workspace = true
+sg-transport = { workspace = true, features = ["quic"] }
 sg-tun.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -23,4 +23,5 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 bytes.workspace = true
+rcgen.workspace = true
 sg-multipath.workspace = true
