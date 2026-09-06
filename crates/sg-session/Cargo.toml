@@ -1,0 +1,16 @@
+[package]
+name = "sg-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "StreamGuard session core: per-session paths, sequencing, reorder/dedup (spec section 15)"
+
+[dependencies]
+sg-core.workspace = true
+sg-multipath.workspace = true
+sg-protocol.workspace = true
+sg-transport.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true

@@ -840,6 +840,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sg-session"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "sg-core",
+ "sg-multipath",
+ "sg-protocol",
+ "sg-transport",
+]
+
+[[package]]
 name = "sg-transport"
 version = "0.1.0"
 dependencies = [
@@ -920,6 +931,7 @@ dependencies = [
  "sg-multipath",
  "sg-platform",
  "sg-protocol",
+ "sg-session",
  "sg-transport",
  "sg-tun",
  "tokio",

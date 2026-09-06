@@ -12,9 +12,11 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
 sg-core.workspace = true
 sg-platform.workspace = true
 sg-protocol.workspace = true
+sg-session.workspace = true
 sg-transport = { workspace = true, features = ["quic"] }
 sg-tun.workspace = true
 tokio.workspace = true

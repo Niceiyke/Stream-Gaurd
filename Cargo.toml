@@ -10,6 +10,7 @@ members = [
     "crates/sg-multipath",
     "crates/sg-routing",
     "crates/sg-platform",
+    "crates/sg-session",
     "apps/streamguard-service",
     "apps/streamguard-gateway",
 ]
@@ -44,6 +45,7 @@ sg-transport = { path = "crates/sg-transport" }
 sg-multipath = { path = "crates/sg-multipath" }
 sg-routing = { path = "crates/sg-routing" }
 sg-platform = { path = "crates/sg-platform" }
+sg-session = { path = "crates/sg-session" }
 
 [profile.release]
 lto = "thin"
