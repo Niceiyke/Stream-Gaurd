@@ -9,6 +9,10 @@
 use sg_core::{error::Result, PathId, SessionId};
 use sg_protocol::Envelope;
 
+/// Real QUIC single-path transport (feature `quic`).
+#[cfg(feature = "quic")]
+pub mod quic;
+
 /// A single encrypted path to the gateway.
 #[async_trait::async_trait]
 pub trait PathTransport: Send + Sync {

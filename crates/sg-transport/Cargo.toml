@@ -6,10 +6,22 @@ rust-version.workspace = true
 license.workspace = true
 description = "StreamGuard secure client-to-gateway transport"
 
+[features]
+default = []
+# Real QUIC single-path transport (quinn + rustls/ring). Enabled by the
+# transport milestone and tests; off by default to keep scaffold builds
+# light and dependency-free.
+quic = ["dep:quinn", "dep:rustls"]
+
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
+quinn = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 sg-core.workspace = true
 sg-protocol.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
