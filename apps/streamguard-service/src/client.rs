@@ -15,7 +15,11 @@
 //!   failover (spec 17 stable egress),
 //! - **rev1 path control**: when the health-driven pick changes, the uplink
 //!   task sends a `Control::PathSelect` so the gateway moves that session's
-//!   downlink to the newly active path.
+//!   downlink to the newly active path,
+//! - **failover**: a transport-level failure (reader `recv` error or a failed
+//!   keepalive send) marks the path unreachable and immediately promotes the
+//!   healthiest surviving path, steering the gateway's downlink there too
+//!   (spec 31.4 path failure).
 //!
 //! The host-side TUN is generic: `LoopbackTun` (non-blocking `WouldBlock`)
 //! is used by the tests; real platform adapters block and must be driven
@@ -61,6 +65,9 @@ pub struct Counters {
     pub keepalives: u64,
     /// `Control::PathSelect` messages sent when the active path changed.
     pub path_selects: u64,
+    /// Paths marked unreachable after their transport failed (connection
+    /// loss or a keepalive send error), triggering failover.
+    pub path_failures: u64,
 }
 
 /// A running client engine. Call `stop` to tear it down.
@@ -98,6 +105,20 @@ impl<T: Tun + Send + 'static> ClientHandle<T> {
     /// The path the uplink currently selects (highest-scoring eligible).
     pub async fn active_path(&self) -> Option<PathId> {
         self.shared.session.lock().await.active_path()
+    }
+
+    /// Force-severs `path_id`'s transport (test hook; simulated physical
+    /// path loss). The connection close is detected by the path's reader,
+    /// which marks the path unreachable and fails over.
+    pub async fn sever_path(&self, path_id: PathId) -> bool {
+        let transport = self.shared.session.lock().await.path(path_id).cloned();
+        match transport {
+            Some(t) => {
+                t.close();
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -179,6 +200,7 @@ pub async fn start<T: Tun + Send + 'static>(
                 session_id,
                 options.keepalive_interval,
                 counters.clone(),
+                shared.clone(),
             )));
         }
     }
@@ -227,7 +249,7 @@ async fn run_loop<T: Tun + Send + 'static>(
 
 async fn reader_loop<T: Tun + Send + 'static>(
     transport: Arc<dyn PathTransport>,
-    _path_id: PathId,
+    path_id: PathId,
     tun: Arc<Mutex<T>>,
     shared: Arc<Shared>,
     counters: Arc<Mutex<Counters>>,
@@ -235,7 +257,12 @@ async fn reader_loop<T: Tun + Send + 'static>(
     loop {
         let envelope = match transport.recv().await {
             Ok(e) => e,
-            Err(_) => break, // connection closed
+            Err(_) => {
+                // Transport-level error = hard down signal: fail over now
+                // rather than leaving a dead path on the health table.
+                fail_path(shared.clone(), counters.clone(), path_id).await;
+                break;
+            }
         };
         match envelope.packet_type {
             // Dedup against the shared per-session window, then inject.
@@ -276,6 +303,7 @@ async fn keepalive_loop(
     session_id: SessionId,
     interval: Duration,
     counters: Arc<Mutex<Counters>>,
+    shared: Arc<Shared>,
 ) {
     loop {
         tokio::time::sleep(interval).await;
@@ -290,9 +318,103 @@ async fn keepalive_loop(
             payload: Bytes::new(),
         };
         if transport.send(env).await.is_err() {
-            return; // connection died; nothing left to keep alive
+            // The path cannot carry keepalives anymore: treat the send
+            // failure as the down signal and let the failover machinery run.
+            fail_path(shared.clone(), counters.clone(), path_id).await;
+            return;
         }
         counters.lock().await.keepalives += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Path failure + path control (rev1)
+// ---------------------------------------------------------------------------
+
+/// Rev1 path control: tells the gateway the session's downlink now uses
+/// `path_id` (fire-and-forget datagram). Idempotent via `Shared.notified`:
+/// returns true only when the announcement is genuinely new.
+async fn announce_path(
+    shared: &Arc<Shared>,
+    counters: &Arc<Mutex<Counters>>,
+    path_id: PathId,
+    session_id: SessionId,
+) -> bool {
+    let changed = {
+        let mut notified = shared.notified.lock().await;
+        if *notified != Some(path_id) {
+            *notified = Some(path_id);
+            true
+        } else {
+            false
+        }
+    };
+    if !changed {
+        return false;
+    }
+    let ctrl = Envelope {
+        version: VERSION,
+        packet_type: PacketType::Control,
+        flags: 0,
+        path_id,
+        session_id,
+        sequence: sg_core::Sequence::new(0),
+        timestamp_ms: 0,
+        payload: ControlMsg::PathSelect { path: path_id.get() }
+            .encode()
+            .expect("path select never exceeds u16::MAX"),
+    };
+    if shared
+        .session
+        .lock()
+        .await
+        .send_on(path_id, ctrl)
+        .await
+        .is_ok()
+    {
+        counters.lock().await.path_selects += 1;
+        true
+    } else {
+        false
+    }
+}
+
+/// Marks `dead` unreachable and triggers failover (spec 31.4).
+///
+/// A transport-level failure (connection loss on `recv`, or a failed
+/// keepalive send) is the hard "path is down" signal. The path is made
+/// ineligible so `choose_path` never picks it again, and if it was the
+/// active path the healthiest surviving path is promoted and the gateway
+/// is steered there immediately — downlink resumes on the standby even
+/// before the next uplink packet.
+async fn fail_path(shared: Arc<Shared>, counters: Arc<Mutex<Counters>>, dead: PathId) {
+    {
+        let mut metrics = shared.metrics.lock().await;
+        let entry = metrics.entry(dead).or_default();
+        *entry = PathMetrics {
+            reachable: false,
+            ..Default::default()
+        };
+    }
+    counters.lock().await.path_failures += 1;
+
+    let promotion = {
+        let mut sess = shared.session.lock().await;
+        let prev = sess.active_path();
+        let metrics = shared.metrics.lock().await;
+        let best = choose_path(&metrics, sess.path_ids().collect::<Vec<_>>().as_slice(), prev);
+        if let Some(b) = best {
+            let _ = sess.set_active_path(b);
+        }
+        // Only steer the gateway when the active path actually moved.
+        match (prev, best) {
+            (Some(p), Some(b)) if p != b => Some(b),
+            _ => None,
+        }
+    };
+    if let Some(next) = promotion {
+        let sid = shared.session.lock().await.session_id();
+        announce_path(&shared, &counters, next, sid).await;
     }
 }
 
@@ -346,39 +468,7 @@ async fn uplink_loop<T: Tun + Send + 'static>(
 
         // Rev1 path control: tell the gateway when the active path changes so
         // its downlink follows the failover (fire-and-forget datagram).
-        let changed = {
-            let mut notified = shared.notified.lock().await;
-            if *notified != Some(path_id) {
-                *notified = Some(path_id);
-                true
-            } else {
-                false
-            }
-        };
-        if changed {
-            let ctrl = Envelope {
-                version: VERSION,
-                packet_type: PacketType::Control,
-                flags: 0,
-                path_id,
-                session_id,
-                sequence: sg_core::Sequence::new(0),
-                timestamp_ms: 0,
-                payload: ControlMsg::PathSelect { path: path_id.get() }
-                    .encode()
-                    .expect("path select never exceeds u16::MAX"),
-            };
-            if shared
-                .session
-                .lock()
-                .await
-                .send_on(path_id, ctrl)
-                .await
-                .is_ok()
-            {
-                counters.lock().await.path_selects += 1;
-            }
-        }
+        announce_path(&shared, &counters, path_id, session_id).await;
 
         let env = Envelope {
             version: VERSION,

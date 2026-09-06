@@ -220,6 +220,12 @@ impl PathTransport for QuicPathTransport {
     fn path_id(&self) -> PathId {
         self.path_id
     }
+
+    fn close(&self) {
+        // Sends CONNECTION_CLOSE; the peer's `recv` then errors immediately,
+        // which is the hard signal the health engine keys failover on.
+        self.conn.close(quinn::VarInt::from_u32(0), b"streamguard: path closed");
+    }
 }
 
 /// Client-side session holder: transport + gateway-issued ticket.

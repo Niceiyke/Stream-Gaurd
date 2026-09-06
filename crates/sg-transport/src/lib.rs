@@ -24,6 +24,11 @@ pub trait PathTransport: Send + Sync {
 
     /// The path id this transport is bound to.
     fn path_id(&self) -> PathId;
+
+    /// Teardown: signals the peer the path is closed. Best-effort; scaffold
+    /// transports may treat it as a no-op. Used to simulate or force a
+    /// physical path loss so the health engine and scheduler can fail over.
+    fn close(&self) {}
 }
 
 /// Identifies a session at the gateway after the mTLS + token exchange.

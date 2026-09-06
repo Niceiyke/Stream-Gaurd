@@ -99,6 +99,20 @@ impl Session {
         Ok(())
     }
 
+    /// Removes a bound path. Losing a path (connection death, link down) must
+    /// not strand the session: if the removed path was active, the session
+    /// falls back to the lowest remaining path id so the downlink keeps
+    /// flowing on a standby. Returns true when the path was bound.
+    pub fn remove_path(&mut self, path_id: PathId) -> bool {
+        if self.paths.remove(&path_id).is_none() {
+            return false;
+        }
+        if self.active_path == Some(path_id) {
+            self.active_path = self.paths.keys().map(|p| p.get()).min().map(PathId::new);
+        }
+        true
+    }
+
     /// Reserves the next outbound sequence number for this session.
     pub fn next_sequence(&mut self) -> Sequence {
         self.out_seq.next_sequence()
@@ -174,7 +188,29 @@ impl SessionManager {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use sg_core::error::{Error, Result};
     use sg_protocol::{Envelope, PacketType, VERSION};
+    use sg_transport::PathTransport;
+    use async_trait::async_trait;
+
+    /// Transport that never does anything (path bookkeeping tests only).
+    #[derive(Debug)]
+    struct NoopTransport;
+
+    #[async_trait]
+    impl PathTransport for NoopTransport {
+        async fn send(&self, _env: Envelope) -> Result<()> {
+            Ok(())
+        }
+
+        async fn recv(&self) -> Result<Envelope> {
+            Err(Error::transport("noop transport cannot receive"))
+        }
+
+        fn path_id(&self) -> PathId {
+            PathId::new(0)
+        }
+    }
 
     #[test]
     fn session_sequences_and_dedups() {
@@ -190,6 +226,38 @@ mod tests {
         let mut session = Session::new(session_id_from_wire(1));
         assert_eq!(session.active_path(), None);
         assert!(session.set_active_path(PathId::new(9)).is_err());
+    }
+
+    #[test]
+    fn removing_the_active_path_promotes_the_lowest_remaining() {
+        let mut session = Session::new(session_id_from_wire(1));
+        let a1 = PathId::new(1);
+        let a2 = PathId::new(2);
+        let a3 = PathId::new(3);
+        let t1 = Arc::new(NoopTransport);
+        let t2 = Arc::new(NoopTransport);
+        let t3 = Arc::new(NoopTransport);
+        session.add_path(t1, a1).unwrap();
+        session.add_path(t2, a2).unwrap();
+        session.add_path(t3, a3).unwrap();
+        assert_eq!(session.active_path(), Some(a1), "first bound path is active");
+
+        assert!(!session.remove_path(PathId::new(9)), "unbound path not removed");
+        assert_eq!(session.path_count(), 3);
+
+        assert!(session.remove_path(a1), "active path removed");
+        assert_eq!(
+            session.active_path(),
+            Some(a2),
+            "fallback promotes the lowest remaining path id"
+        );
+        assert_eq!(session.path_count(), 2);
+
+        assert!(session.remove_path(a3));
+        assert_eq!(session.active_path(), Some(a2));
+
+        assert!(session.remove_path(a2));
+        assert_eq!(session.active_path(), None, "no paths left -> no active path");
     }
 
     #[test]

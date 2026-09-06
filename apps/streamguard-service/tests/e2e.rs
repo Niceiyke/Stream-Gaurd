@@ -298,3 +298,121 @@ async fn keepalives_refresh_all_paths() {
     client.stop().await;
     gw.stop().await;
 }
+
+#[tokio::test]
+async fn client_fails_over_when_the_active_path_dies() {
+    let (cert_der, key_der) = {
+        let c = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        (c.cert.der().to_vec(), c.key_pair.serialize_der())
+    };
+    let server_cfg = server_tls(&cert_der, &key_der).unwrap();
+    let client_cfg = client_tls(&cert_der).unwrap();
+    let gateway = GatewayQuic::bind("127.0.0.1:0".parse().unwrap(), server_cfg).unwrap();
+    let addr = gateway.local_addr().unwrap();
+
+    let secret = b"failover-test-secret".to_vec();
+    let host_tun = LoopbackTun::with_config(TunConfig {
+        name: "sg-wan0".into(),
+        address: "192.168.1.1".into(),
+        prefix_len: 24,
+        mtu: 1300,
+    });
+    let mut gw = tunnel::start(host_tun, gateway, secret.clone()).await;
+    let host_task = tokio::spawn(host_echo(gw.tun.clone()));
+
+    let client_tun = LoopbackTun::with_config(TunConfig {
+        name: "sg-lan0".into(),
+        address: "10.0.85.1".into(),
+        prefix_len: 24,
+        mtu: 1300,
+    });
+    let session = session_id_from_wire(0xcafebabe);
+    let token = sg_auth::issue(&secret, session, 3600);
+    let mut client = client::start(
+        client_tun,
+        client::ClientOptions {
+            addr,
+            server_name: "localhost".into(),
+            client_config: client_cfg,
+            keepalive_interval: Duration::from_secs(3600),
+        },
+        session,
+        &[PathId::new(1), PathId::new(2)],
+        &token,
+    )
+    .await
+    .unwrap();
+    sleep(Duration::from_millis(150)).await;
+    assert_eq!(gw.counters().await.paths, 2, "both paths accredited");
+
+    // ---- round trip on the initial active path (1) ----
+    let req = icmp_request([10, 0, 85, 2], [8, 8, 8, 8], 0x1111);
+    client
+        .tun
+        .lock()
+        .await
+        .enqueue(Bytes::from(req.clone()));
+    sleep(Duration::from_millis(150)).await;
+    assert_eq!(client.counters().await.datagrams_to_gateway, 1);
+    sleep(Duration::from_millis(250)).await;
+    assert_eq!(client.counters().await.frames_to_host, 1, "reply 1 delivered");
+
+    // ---- sever the active path's QUIC connection (simulated link down) ----
+    assert!(client.sever_path(PathId::new(1)).await, "path 1 was bound");
+
+    // The client must detect the loss, mark the path unreachable, promote
+    // path 2 AND steer the gateway; the gateway must evict the dead path so
+    // its downlink falls back to path 2 instead of a dead connection.
+    let mut converged = false;
+    for _ in 0..50 {
+        if client.counters().await.path_failures >= 1
+            && client.active_path().await == Some(PathId::new(2))
+            && gw.counters().await.paths_evicted >= 1
+        {
+            converged = true;
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        converged,
+        "client detected the loss (path_failures), promoted the standby (active=2), \
+         and the gateway evicted the dead path (paths_evicted)"
+    );
+    assert!(
+        client.counters().await.path_selects >= 1,
+        "the client steered the gateway's downlink to path 2"
+    );
+
+    // ---- traffic keeps flowing over path 2 after the failover ----
+    let req2 = icmp_request([10, 0, 85, 2], [1, 1, 1, 1], 0x2222);
+    client
+        .tun
+        .lock()
+        .await
+        .enqueue(Bytes::from(req2.clone()));
+    sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        client.counters().await.datagrams_to_gateway, 2,
+        "request 2 leaves the client after failover"
+    );
+
+    let mut replied = false;
+    for _ in 0..50 {
+        if client.counters().await.frames_to_host == 2 {
+            replied = true;
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(replied, "reply 2 arrives over the promoted path");
+    let frames = client.tun.lock().await.drain_outbound();
+    assert!(
+        frames.contains(&Bytes::from(icmp_reply([10, 0, 85, 2], [1, 1, 1, 1], 0x2222))),
+        "reply 2 goes to the client TUN"
+    );
+
+    client.stop().await;
+    gw.stop().await;
+    host_task.abort();
+}

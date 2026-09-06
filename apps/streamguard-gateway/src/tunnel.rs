@@ -52,6 +52,9 @@ pub struct Counters {
     pub keepalives: u64,
     /// `Control::PathSelect` messages applied (downlink moved to a new path).
     pub path_selects: u64,
+    /// Paths removed from sessions because their QUIC connection died. The
+    /// session falls back to a surviving path (see `Session::remove_path`).
+    pub paths_evicted: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +291,10 @@ async fn reader_loop<T: Tun + Send + 'static>(
     // Remember authenticated init: require the path's OWN envelope session
     // to match what the ticket accredited (else the handshake was for a
     // different session).
+    // `binds` is the set of (session, path) pairs THIS connection bound; on
+    // connection loss they are evicted so the session falls back to a
+    // surviving path and the downlink never tries a dead path.
+    let mut binds: Vec<(SessionId, PathId)> = Vec::new();
     loop {
         let envelope = match first_frame.take() {
             Some(e) => e,
@@ -299,7 +306,7 @@ async fn reader_loop<T: Tun + Send + 'static>(
         if let Some(accredited) = first_session {
             if session_prefix(envelope.session_id) != session_prefix(accredited) {
                 tracing::warn!("path session does not match accredited session; dropping");
-                return;
+                break;
             }
         }
 
@@ -308,8 +315,10 @@ async fn reader_loop<T: Tun + Send + 'static>(
             let mut sessions = sessions.lock().await;
             let session = sessions.get_or_create(envelope.session_id);
             let is_new = session.path_count() == 0;
-            if !session.has_path(envelope.path_id) {
-                let _ = session.add_path(transport.clone(), envelope.path_id);
+            if !session.has_path(envelope.path_id)
+                && session.add_path(transport.clone(), envelope.path_id).is_ok()
+            {
+                binds.push((envelope.session_id, envelope.path_id));
             }
             let accept = match envelope.packet_type {
                 PacketType::Data | PacketType::Duplicate => {
@@ -365,6 +374,27 @@ async fn reader_loop<T: Tun + Send + 'static>(
                 counters.lock().await.keepalives += 1;
             }
             _ => {} // Probe / PathStatus are reserved for later milestones
+        }
+    }
+
+    // The connection that fed this reader is gone: evict every path it had
+    // bound so the session falls back to a surviving path (spec 12 phase 1
+    // "migrate on failure") and the downlink stops targeting a dead path.
+    if !binds.is_empty() {
+        let mut evicted = 0u64;
+        {
+            let mut sessions = sessions.lock().await;
+            for (sid, pid) in &binds {
+                if let Some(s) = sessions.session_mut(*sid) {
+                    if s.remove_path(*pid) {
+                        evicted += 1;
+                    }
+                }
+            }
+        }
+        if evicted > 0 {
+            counters.lock().await.paths_evicted += evicted;
+            tracing::debug!(evicted, "evicted bound paths of a dead connection");
         }
     }
 }

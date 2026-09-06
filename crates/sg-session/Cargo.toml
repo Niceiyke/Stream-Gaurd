@@ -13,4 +13,5 @@ sg-protocol.workspace = true
 sg-transport.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 bytes.workspace = true
