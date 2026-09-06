@@ -4,11 +4,16 @@
 //! Wire encoding (big-endian):
 //!
 //! ```text
-//! Init:  type(1)=0x00  sid(4)
-//!        token_len(2)  token(token_len)
-//! Ack:   type(1)=0x01  sid(4)
-//! Nack:  type(1)=0x02  sid(4)  reason_len(2)  reason(reason_len)
+//! Init:       type(1)=0x00  sid(4)
+//!             token_len(2)  token(token_len)
+//! Ack:        type(1)=0x01  sid(4)
+//! Nack:       type(1)=0x02  sid(4)  reason_len(2)  reason(reason_len)
+//! PathSelect: type(1)=0x03  path(1)
 //! ```
+//!
+//! `PathSelect` is the rev1 path-control message: the client tells the
+//! gateway which bound path should carry that session's downlink traffic,
+//! so a client-side failover moves the gateway's active path too.
 //!
 //! `sid` is the same 4-byte wire prefix the envelope carries (spec 11.1).
 //! Carried as the `payload` bytes of a `PacketType::Control` envelope.
@@ -21,6 +26,8 @@ pub enum ControlMsg {
     Init { sid: u32, token: String },
     Ack { sid: u32 },
     Nack { sid: u32, reason: String },
+    /// Asks the gateway to serve downlink on `path` for the envelope's session.
+    PathSelect { path: u8 },
 }
 
 impl ControlMsg {
@@ -48,6 +55,10 @@ impl ControlMsg {
                 out.put_u32(*sid);
                 out.put_u16(reason.len() as u16);
                 out.put_slice(reason.as_bytes());
+            }
+            ControlMsg::PathSelect { path } => {
+                out.put_u8(0x03);
+                out.put_u8(*path);
             }
         }
         Ok(out.freeze())
@@ -91,6 +102,12 @@ impl ControlMsg {
                     .map_err(|_| Error::protocol("nack reason not utf-8"))?;
                 Ok(ControlMsg::Nack { sid, reason })
             }
+            0x03 => {
+                if buf.remaining() < 1 {
+                    return Err(Error::protocol("short path select"));
+                }
+                Ok(ControlMsg::PathSelect { path: buf.get_u8() })
+            }
             other => Err(Error::protocol(format!("unknown control kind {other}"))),
         }
     }
@@ -112,6 +129,7 @@ mod tests {
                 sid: 0xdeadbeef,
                 reason: "bad signature".into(),
             },
+            ControlMsg::PathSelect { path: 2 },
         ] {
             let wire = msg.encode().unwrap();
             assert_eq!(ControlMsg::decode(&wire).unwrap(), msg);

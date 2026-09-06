@@ -107,9 +107,14 @@ async fn client_and_gateway_engines_talk_over_two_paths() {
     let token = sg_auth::issue(&secret, session, 3600);
     let mut client = client::start(
         client_tun,
-        addr,
-        "localhost",
-        client_cfg,
+        client::ClientOptions {
+            addr,
+            server_name: "localhost".into(),
+            client_config: client_cfg,
+            // Keepalives are covered by `keepalives_refresh_all_paths`; keep
+            // this test's counters deterministic by parking the cadence.
+            keepalive_interval: Duration::from_secs(3600),
+        },
         session,
         &[PathId::new(1), PathId::new(2)],
         &token,
@@ -144,6 +149,11 @@ async fn client_and_gateway_engines_talk_over_two_paths() {
         "single device session learned from the wire id"
     );
     assert_eq!(gw.counters().await.frames_to_host, 1, "request 1 reaches host TUN");
+    assert_eq!(
+        gw.counters().await.path_selects,
+        0,
+        "the initial active path is not re-announced"
+    );
 
     sleep(Duration::from_millis(250)).await;
     assert_eq!(
@@ -200,6 +210,11 @@ async fn client_and_gateway_engines_talk_over_two_paths() {
     );
     assert_eq!(client.counters().await.datagrams_to_gateway, 2);
     assert_eq!(gw.counters().await.frames_to_host, 2, "request 2 reaches host TUN");
+    assert_eq!(
+        gw.counters().await.path_selects,
+        1,
+        "the client steered the gateway's downlink to path 2"
+    );
 
     // ---- replies 1 and 2 both return, in order, no duplicates ----
     sleep(Duration::from_millis(150)).await;
@@ -220,4 +235,66 @@ async fn client_and_gateway_engines_talk_over_two_paths() {
     client.stop().await;
     gw.stop().await;
     host_task.abort();
+}
+
+#[tokio::test]
+async fn keepalives_refresh_all_paths() {
+    let (cert_der, key_der) = {
+        let c = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        (c.cert.der().to_vec(), c.key_pair.serialize_der())
+    };
+    let server_cfg = server_tls(&cert_der, &key_der).unwrap();
+    let client_cfg = client_tls(&cert_der).unwrap();
+    let gateway = GatewayQuic::bind("127.0.0.1:0".parse().unwrap(), server_cfg).unwrap();
+    let addr = gateway.local_addr().unwrap();
+
+    let secret = b"keepalive-test-secret".to_vec();
+    let host_tun = LoopbackTun::with_config(TunConfig {
+        name: "sg-wan0".into(),
+        address: "192.168.1.1".into(),
+        prefix_len: 24,
+        mtu: 1300,
+    });
+    let mut gw = tunnel::start(host_tun, gateway, secret.clone()).await;
+
+    let client_tun = LoopbackTun::with_config(TunConfig {
+        name: "sg-lan0".into(),
+        address: "10.0.85.1".into(),
+        prefix_len: 24,
+        mtu: 1300,
+    });
+    let session = session_id_from_wire(0xf00df00d);
+    let token = sg_auth::issue(&secret, session, 3600);
+    let mut client = client::start(
+        client_tun,
+        client::ClientOptions {
+            addr,
+            server_name: "localhost".into(),
+            client_config: client_cfg,
+            keepalive_interval: Duration::from_millis(30),
+        },
+        session,
+        &[PathId::new(1), PathId::new(2)],
+        &token,
+    )
+    .await
+    .unwrap();
+
+    // No data flows here: every packet on the wire is a keepalive, so the
+    // client must emit on BOTH paths (the standby too) to keep NAT mappings
+    // fresh for failover (spec 17 stable egress).
+    sleep(Duration::from_millis(300)).await;
+    assert!(
+        client.counters().await.keepalives >= 4,
+        "the client emits keepalives repeatedly on every bound path"
+    );
+    assert!(
+        gw.counters().await.keepalives >= 4,
+        "the gateway observes keepalives on both connections"
+    );
+    assert_eq!(gw.counters().await.paths, 2, "both paths accredited");
+    assert_eq!(gw.counters().await.auth_rejections, 0);
+
+    client.stop().await;
+    gw.stop().await;
 }

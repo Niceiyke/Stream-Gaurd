@@ -47,6 +47,11 @@ pub struct Counters {
     pub datagrams_to_client: u64,
     /// Sequences rejected by the uplink reorder window.
     pub duplicates_dropped: u64,
+    /// App-level keepalives received (standby paths refreshing their NAT
+    /// mappings so failover can reach them).
+    pub keepalives: u64,
+    /// `Control::PathSelect` messages applied (downlink moved to a new path).
+    pub path_selects: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -332,7 +337,34 @@ async fn reader_loop<T: Tun + Send + 'static>(
             PacketType::Data | PacketType::Duplicate => {
                 counters.lock().await.duplicates_dropped += 1;
             }
-            _ => {}
+            // Rev1 path control: the client picked a new active path; move the
+            // downlink for its session there (fire-and-forget datagram).
+            PacketType::Control => {
+                if let Ok(ControlMsg::PathSelect { path }) =
+                    ControlMsg::decode(&envelope.payload)
+                {
+                    let applied = {
+                        let mut sessions = sessions.lock().await;
+                        match sessions.session_mut(envelope.session_id) {
+                            Some(s) => s.set_active_path(PathId::new(path)).is_ok(),
+                            None => false,
+                        }
+                    };
+                    if applied {
+                        counters.lock().await.path_selects += 1;
+                    } else {
+                        tracing::debug!(
+                            ?path,
+                            ?envelope.session_id,
+                            "path select ignored: session/path not bound yet"
+                        );
+                    }
+                }
+            }
+            PacketType::Keepalive => {
+                counters.lock().await.keepalives += 1;
+            }
+            _ => {} // Probe / PathStatus are reserved for later milestones
         }
     }
 }

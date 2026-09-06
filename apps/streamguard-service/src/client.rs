@@ -8,7 +8,14 @@
 //!   per-session reorder window, write the host IP packet into the TUN,
 //! - an **uplink task**: read a local packet from the TUN, sequence it,
 //!   pick the healthiest eligible path (phase 1 active/standby driven by
-//!   `DefaultScorer`) and send it.
+//!   `DefaultScorer`) and send it,
+//! - a **keepalive task per path**: emit `Keepalive` envelopes on every
+//!   bound path (spec 12 phase 1 "keep alternate path alive") so standby
+//!   QUIC connections stay warm and their NAT mappings stay fresh for
+//!   failover (spec 17 stable egress),
+//! - **rev1 path control**: when the health-driven pick changes, the uplink
+//!   task sends a `Control::PathSelect` so the gateway moves that session's
+//!   downlink to the newly active path.
 //!
 //! The host-side TUN is generic: `LoopbackTun` (non-blocking `WouldBlock`)
 //! is used by the tests; real platform adapters block and must be driven
@@ -22,6 +29,7 @@ use bytes::Bytes;
 use sg_core::error::Error;
 use sg_core::{PathId, SessionId};
 use sg_health::{DefaultScorer, PathMetrics, Scorer};
+use sg_protocol::control::ControlMsg;
 use sg_protocol::{Envelope, PacketType, VERSION};
 use sg_session::Session;
 use sg_transport::quic::{bootstrap_v1, connect_path};
@@ -34,6 +42,9 @@ use tokio::task::JoinHandle;
 struct Shared {
     session: Mutex<Session>,
     metrics: Mutex<HashMap<PathId, PathMetrics>>,
+    /// The last active path the gateway was told about (downlink target).
+    /// `None` before the first uplink decision.
+    notified: Mutex<Option<PathId>>,
 }
 
 /// Aggregate counters exposed to tests after the engine runs.
@@ -42,10 +53,14 @@ pub struct Counters {
     pub paths: u64,
     /// IP packets written into the local TUN by downlink readers.
     pub frames_to_host: u64,
-    /// Uplink envelopes sent to the gateway.
+    /// Uplink data envelopes sent to the gateway.
     pub datagrams_to_gateway: u64,
     /// Sequences rejected by the downlink reorder window.
     pub duplicates_dropped: u64,
+    /// Keepalive envelopes emitted on all bound paths (NAT refresh).
+    pub keepalives: u64,
+    /// `Control::PathSelect` messages sent when the active path changed.
+    pub path_selects: u64,
 }
 
 /// A running client engine. Call `stop` to tear it down.
@@ -86,15 +101,28 @@ impl<T: Tun + Send + 'static> ClientHandle<T> {
     }
 }
 
+/// Transport + tuning options consumed by `start`.
+#[derive(Debug, Clone)]
+pub struct ClientOptions {
+    /// Gateway UDP/QUIC endpoint.
+    pub addr: std::net::SocketAddr,
+    /// TLS SNI / certificate name expected from the gateway.
+    pub server_name: String,
+    /// Trusted-client QUIC configuration.
+    pub client_config: quinn::ClientConfig,
+    /// Cadence for app-level `Keepalive` envelopes on every bound path
+    /// (NAT-mapping refresh for standby paths, spec 12/17). `Duration::ZERO`
+    /// disables keepalives.
+    pub keepalive_interval: Duration,
+}
+
 /// Opens one QUIC path to the gateway per entry, authenticates each with the
 /// v1 bootstrap handshake (`token` = gateway-signed session ticket), binds
 /// the accredited paths to the session, then starts the uplink + downlink
-/// loops.
+/// loops and one keepalive task per path.
 pub async fn start<T: Tun + Send + 'static>(
     tun: T,
-    addr: std::net::SocketAddr,
-    server_name: &str,
-    client_config: quinn::ClientConfig,
+    options: ClientOptions,
     session_id: SessionId,
     paths: &[PathId],
     token: &str,
@@ -108,7 +136,13 @@ pub async fn start<T: Tun + Send + 'static>(
     // Open and bind one transport per path, in the given order. The first
     // bound path becomes the initial active path; health re-ranks later.
     for path_id in paths.iter().copied() {
-        let path = connect_path(addr, server_name, client_config.clone(), path_id).await?;
+        let path = connect_path(
+            options.addr,
+            &options.server_name,
+            options.client_config.clone(),
+            path_id,
+        )
+        .await?;
         // Each path must present the signed session ticket before it can
         // carry traffic for this session (spec 15.5 / engineering step 8).
         let accredited = bootstrap_v1(&path, session_id, token).await?;
@@ -120,21 +154,33 @@ pub async fn start<T: Tun + Send + 'static>(
         session.add_path(path, path_id)?;
     }
 
+    let initial_active = session.active_path();
     let shared = Arc::new(Shared {
         session: Mutex::new(session),
         metrics: Mutex::new(HashMap::new()),
+        notified: Mutex::new(initial_active),
     });
 
-    // Spawn one downlink reader per bound path.
+    // Spawn one downlink reader and one keepalive task per bound path.
     let mut reader_handles = Vec::new();
+    let mut keepalive_handles = Vec::new();
     for (path_id, transport) in transports {
         reader_handles.push(tokio::spawn(reader_loop(
-            transport,
+            transport.clone(),
             path_id,
             tun.clone(),
             shared.clone(),
             counters.clone(),
         )));
+        if !options.keepalive_interval.is_zero() {
+            keepalive_handles.push(tokio::spawn(keepalive_loop(
+                transport,
+                path_id,
+                session_id,
+                options.keepalive_interval,
+                counters.clone(),
+            )));
+        }
     }
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -144,6 +190,7 @@ pub async fn start<T: Tun + Send + 'static>(
         counters.clone(),
         shutdown_rx,
         reader_handles,
+        keepalive_handles,
     ));
 
     Ok(ClientHandle {
@@ -161,6 +208,7 @@ async fn run_loop<T: Tun + Send + 'static>(
     counters: Arc<Mutex<Counters>>,
     mut shutdown: oneshot::Receiver<()>,
     reader_handles: Vec<JoinHandle<()>>,
+    keepalive_handles: Vec<JoinHandle<()>>,
 ) {
     let mut uplink_task = tokio::spawn(uplink_loop(tun, shared.clone(), counters));
     tokio::select! {
@@ -168,7 +216,7 @@ async fn run_loop<T: Tun + Send + 'static>(
         res = &mut uplink_task => { if let Err(e) = res { tracing::warn!(error = %e, "uplink loop exited"); } }
     }
     uplink_task.abort();
-    for h in reader_handles {
+    for h in reader_handles.into_iter().chain(keepalive_handles) {
         h.abort();
     }
 }
@@ -212,6 +260,43 @@ async fn reader_loop<T: Tun + Send + 'static>(
 }
 
 // ---------------------------------------------------------------------------
+// Keepalive task – one per path; keeps standby paths + NAT mappings alive
+// ---------------------------------------------------------------------------
+
+/// Emits an app-level `Keepalive` envelope on `path_id` every `interval`.
+///
+/// Standby (non-active) paths otherwise carry no traffic; without outbound
+/// packets the client's NAT mapping for that path can time out and the
+/// gateway egress becomes unreachable exactly when failover needs it
+/// (spec 12 phase 1 / spec 17). Sequence 0 is used so keepalives never
+/// consume data sequence numbers or pollute the gateway reorder window.
+async fn keepalive_loop(
+    transport: Arc<dyn PathTransport>,
+    path_id: PathId,
+    session_id: SessionId,
+    interval: Duration,
+    counters: Arc<Mutex<Counters>>,
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+        let env = Envelope {
+            version: VERSION,
+            packet_type: PacketType::Keepalive,
+            flags: 0,
+            path_id,
+            session_id,
+            sequence: sg_core::Sequence::new(0),
+            timestamp_ms: 0,
+            payload: Bytes::new(),
+        };
+        if transport.send(env).await.is_err() {
+            return; // connection died; nothing left to keep alive
+        }
+        counters.lock().await.keepalives += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Uplink loop – local packets into the tunnel
 // ---------------------------------------------------------------------------
 
@@ -248,7 +333,8 @@ async fn uplink_loop<T: Tun + Send + 'static>(
             let seq = sess.next_sequence();
             let best = {
                 let metrics = shared.metrics.lock().await;
-                choose_path(&metrics, sess.path_ids().collect::<Vec<_>>().as_slice())
+                let current = sess.active_path();
+                choose_path(&metrics, sess.path_ids().collect::<Vec<_>>().as_slice(), current)
             };
             let best = match best {
                 Some(p) => p,
@@ -257,6 +343,42 @@ async fn uplink_loop<T: Tun + Send + 'static>(
             let _ = sess.set_active_path(best);
             (seq, best, sess.session_id())
         };
+
+        // Rev1 path control: tell the gateway when the active path changes so
+        // its downlink follows the failover (fire-and-forget datagram).
+        let changed = {
+            let mut notified = shared.notified.lock().await;
+            if *notified != Some(path_id) {
+                *notified = Some(path_id);
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            let ctrl = Envelope {
+                version: VERSION,
+                packet_type: PacketType::Control,
+                flags: 0,
+                path_id,
+                session_id,
+                sequence: sg_core::Sequence::new(0),
+                timestamp_ms: 0,
+                payload: ControlMsg::PathSelect { path: path_id.get() }
+                    .encode()
+                    .expect("path select never exceeds u16::MAX"),
+            };
+            if shared
+                .session
+                .lock()
+                .await
+                .send_on(path_id, ctrl)
+                .await
+                .is_ok()
+            {
+                counters.lock().await.path_selects += 1;
+            }
+        }
 
         let env = Envelope {
             version: VERSION,
@@ -281,19 +403,40 @@ async fn uplink_loop<T: Tun + Send + 'static>(
 /// Picks the eligible path with the highest score among `paths`; an
 /// unmetered path is assumed eligible (initial active/standby phase).
 /// Ineligible (e.g. unreachable) paths are never chosen.
-fn choose_path(metrics: &HashMap<PathId, PathMetrics>, paths: &[PathId]) -> Option<PathId> {
+///
+/// Ties (common before the first measurements arrive) are broken toward the
+/// currently active path, falling back to the lowest path id, so the initial
+/// uplink decision is deterministic and never triggers a spurious
+/// `PathSelect`.
+fn choose_path(
+    metrics: &HashMap<PathId, PathMetrics>,
+    paths: &[PathId],
+    current: Option<PathId>,
+) -> Option<PathId> {
     let scorer = DefaultScorer::default();
+    let mut ordered: Vec<PathId> = paths.to_vec();
+    ordered.sort_by_key(|p| p.get());
     let mut best: Option<(PathId, f32)> = None;
-    for pid in paths {
-        let score = match metrics.get(pid) {
+    for pid in ordered {
+        let score = match metrics.get(&pid) {
             Some(m) if m.is_eligible() => scorer.score(m),
             Some(_) => -1.0, // metered but ineligible
             None => 0.0,     // no measurement yet → eligible-by-default
         };
-        match best {
-            None => best = Some((*pid, score)),
-            Some((_, s)) if score > s => best = Some((*pid, score)),
-            _ => {}
+        let better = match best {
+            None => true,
+            Some((_, best_score)) if score > best_score => true,
+            Some((best_pid, best_score)) => {
+                // Equal score: if the candidate IS the current active path
+                // and the current best is a different path, keep the active
+                // one so we never re-announce on a tie.
+                score == best_score
+                    && current.is_some_and(|c| c == pid)
+                    && current.is_some_and(|c| c != best_pid)
+            }
+        };
+        if better {
+            best = Some((pid, score));
         }
     }
     best.map(|(pid, _)| pid)
@@ -312,8 +455,14 @@ mod tests {
         let paths = [PathId::new(1), PathId::new(2), PathId::new(3)];
         let mut metrics = HashMap::new();
 
-        // No metrics → all eligible-by-default, first one wins.
-        assert_eq!(choose_path(&metrics, &paths), Some(PathId::new(1)));
+        // No metrics → all eligible-by-default, lowest id wins; ties keep
+        // the current active path when one is given.
+        assert_eq!(choose_path(&metrics, &paths, None), Some(PathId::new(1)));
+        assert_eq!(
+            choose_path(&metrics, &paths, Some(PathId::new(2))),
+            Some(PathId::new(2)),
+            "an idle tie never re-announces the active path"
+        );
 
         // Unreachable path is never chosen even if it is first.
         metrics.insert(
@@ -323,7 +472,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(choose_path(&metrics, &paths), Some(PathId::new(2)));
+        assert_eq!(choose_path(&metrics, &paths, None), Some(PathId::new(2)));
 
         // Healthy path 3 outranks the unreported path 2.
         metrics.insert(
@@ -336,7 +485,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(choose_path(&metrics, &paths), Some(PathId::new(3)));
+        assert_eq!(
+            choose_path(&metrics, &paths, Some(PathId::new(3))),
+            Some(PathId::new(3))
+        );
 
         // A degraded (high-loss) healthy-looking path loses to a clean one.
         metrics.insert(
@@ -349,7 +501,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(choose_path(&metrics, &paths), Some(PathId::new(3)));
+        assert_eq!(
+            choose_path(&metrics, &paths, Some(PathId::new(2))),
+            Some(PathId::new(3))
+        );
     }
 
     fn fake_packet(src: [u8; 4], dst: [u8; 4]) -> Vec<u8> {
@@ -419,9 +574,12 @@ mod tests {
         let session_id = sg_session::session_id_from_wire(0x12345678);
         let mut handle = start(
             tun,
-            addr,
-            "localhost",
-            client_cfg,
+            ClientOptions {
+                addr,
+                server_name: "localhost".into(),
+                client_config: client_cfg,
+                keepalive_interval: Duration::from_secs(3600),
+            },
             session_id,
             &[PathId::new(1)],
             "unit-test-ticket",
