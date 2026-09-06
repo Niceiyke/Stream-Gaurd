@@ -1,0 +1,15 @@
+[package]
+name = "sg-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "StreamGuard secure client-to-gateway transport"
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+sg-core.workspace = true
+sg-protocol.workspace = true
+tokio.workspace = true
+tracing.workspace = true

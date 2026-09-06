@@ -1,0 +1,11 @@
+[package]
+name = "sg-routing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "StreamGuard host route configuration and tunnel-route exclusions"
+
+[dependencies]
+sg-core.workspace = true
+tracing.workspace = true

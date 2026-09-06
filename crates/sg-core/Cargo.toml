@@ -1,0 +1,12 @@
+[package]
+name = "sg-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "StreamGuard shared IDs, sessions, configuration, errors and common types"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+.idea/
+.vscode/
+*.iml
+Thumbs.db
+Desktop.ini
+.DS_Store
+.env
+.env.local
+*.pem
+*.crt
+*.key
+!testdata/**/*.pem

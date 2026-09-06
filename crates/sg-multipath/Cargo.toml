@@ -1,0 +1,12 @@
+[package]
+name = "sg-multipath"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "StreamGuard scheduling, failover, redundancy, sequencing, deduplication and reordering"
+
+[dependencies]
+sg-core.workspace = true
+sg-health.workspace = true
+sg-protocol.workspace = true

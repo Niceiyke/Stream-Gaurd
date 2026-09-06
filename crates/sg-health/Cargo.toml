@@ -1,0 +1,11 @@
+[package]
+name = "sg-health"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "StreamGuard latency/loss/jitter/reachability measurements and path scoring"
+
+[dependencies]
+serde.workspace = true
+sg-core.workspace = true

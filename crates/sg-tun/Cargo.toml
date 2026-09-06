@@ -1,0 +1,11 @@
+[package]
+name = "sg-tun"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "StreamGuard cross-platform virtual NIC abstraction"
+
+[dependencies]
+bytes.workspace = true
+sg-core.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "sg-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "StreamGuard control messages, packet envelope and protocol versioning"
+
+[dependencies]
+bytes.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+sg-core.workspace = true

@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sg-core",
+    "crates/sg-protocol",
+    "crates/sg-tun",
+    "crates/sg-network",
+    "crates/sg-health",
+    "crates/sg-transport",
+    "crates/sg-multipath",
+    "crates/sg-routing",
+    "crates/sg-platform",
+    "apps/streamguard-service",
+    "apps/streamguard-gateway",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+sg-core = { path = "crates/sg-core" }
+sg-protocol = { path = "crates/sg-protocol" }
+sg-tun = { path = "crates/sg-tun" }
+sg-network = { path = "crates/sg-network" }
+sg-health = { path = "crates/sg-health" }
+sg-transport = { path = "crates/sg-transport" }
+sg-multipath = { path = "crates/sg-multipath" }
+sg-routing = { path = "crates/sg-routing" }
+sg-platform = { path = "crates/sg-platform" }
+
+[profile.release]
+lto = "thin"

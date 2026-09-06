@@ -1,0 +1,11 @@
+[package]
+name = "sg-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "StreamGuard per-OS adapter, socket, route and firewall behavior"
+
+[dependencies]
+sg-core.workspace = true
+sg-tun.workspace = true
