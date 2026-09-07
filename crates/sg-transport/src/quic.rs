@@ -146,7 +146,10 @@ pub async fn connect_path_on_interface(
         .map_err(|e| Error::transport(format!("connect error: {e}")))?
         .await
         .map_err(|e| Error::transport(format!("handshake failed: {e}")))?;
-    Ok(QuicPathTransport::new(conn, path_id))
+    match interface_index {
+        Some(index) => Ok(QuicPathTransport::new_bound(conn, path_id, index)),
+        None => Ok(QuicPathTransport::new(conn, path_id)),
+    }
 }
 
 /// Builds a UDP socket bound only to the NIC with the given interface index.
@@ -295,12 +298,46 @@ fn envelope(
 pub struct QuicPathTransport {
     conn: quinn::Connection,
     path_id: PathId,
+    /// The physical NIC this connection is bound to. `None` for unbound
+    /// transports (dev simulation, gateway accept side): their QUIC stats
+    /// describe whatever loopback they happen to ride, not an interface, so
+    /// they must not report a bandwidth estimate (spec 13).
+    bound_to_nic: Option<u32>,
 }
 
 impl QuicPathTransport {
     pub fn new(conn: quinn::Connection, path_id: PathId) -> Self {
-        Self { conn, path_id }
+        Self {
+            conn,
+            path_id,
+            bound_to_nic: None,
+        }
     }
+
+    /// A connection bound to a specific NIC (per-interface socket, spec 8).
+    /// Only bound transports report a bandwidth estimate.
+    pub fn new_bound(conn: quinn::Connection, path_id: PathId, nic_index: u32) -> Self {
+        Self {
+            conn,
+            path_id,
+            bound_to_nic: Some(nic_index),
+        }
+    }
+}
+
+/// Bandwidth-delay-product estimate of achievable throughput (spec 13).
+///
+/// `available_kbps ≈ cwnd_bytes * 8 / rtt_sec / 1000`: the congestion window
+/// bounds the bytes in flight, and dividing by the RTT yields how fast the
+/// path can absorb them. Exposed separately so the loopback test can verify
+/// the math without a live connection.
+fn estimate_kbps(rtt: Duration, cwnd: u64) -> Option<u64> {
+    let rtt_secs = rtt.as_secs_f64();
+    if rtt_secs <= 0.0 || cwnd == 0 {
+        return None;
+    }
+    let kbps = (cwnd as f64 * 8.0 / rtt_secs / 1000.0).ceil();
+    Some(kbps.min(u64::MAX as f64) as u64)
 }
 
 #[async_trait]
@@ -339,6 +376,15 @@ impl PathTransport for QuicPathTransport {
         // Sends CONNECTION_CLOSE; the peer's `recv` then errors immediately,
         // which is the hard signal the health engine keys failover on.
         self.conn.close(quinn::VarInt::from_u32(0), b"streamguard: path closed");
+    }
+
+    fn available_kbps(&self) -> Option<u64> {
+        // Unbound transports do not ride a real NIC, so their congestion
+        // stats measure loopback, not the path's actual capacity (spec 13 /
+        // spec 8). Only interface-bound connections estimate bandwidth.
+        self.bound_to_nic?;
+        let path = self.conn.stats().path;
+        estimate_kbps(path.rtt, path.cwnd)
     }
 }
 
@@ -396,6 +442,19 @@ mod tests {
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()])
             .expect("rcgen self-signed cert");
         (certified.cert.der().to_vec(), certified.key_pair.serialize_der())
+    }
+
+    #[test]
+    fn bdp_throughput_estimate() {
+        // cwnd 100 KiB, rtt 40 ms -> 100*1024 bytes * 8 / 0.04 s / 1000 = 20.48 Mbps
+        let kbps = estimate_kbps(Duration::from_millis(40), 100 * 1024).unwrap();
+        assert_eq!(kbps, 20_480);
+
+        // No window yet (fresh connection) -> no estimate.
+        assert_eq!(estimate_kbps(Duration::ZERO, 0), None);
+        assert_eq!(estimate_kbps(Duration::from_millis(1), 0), None);
+        // rtt of zero with a positive window is meaningless too.
+        assert_eq!(estimate_kbps(Duration::ZERO, 1200), None);
     }
 
     #[tokio::test]

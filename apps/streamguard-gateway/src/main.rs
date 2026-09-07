@@ -18,6 +18,9 @@
 //!   bootstrap tickets with (spec 22 handshake) — required.
 //! - `STREAMGUARD_PORT`         QUIC listener port (default 12423).
 //! - `STREAMGUARD_WAN`          WAN interface for NAT planning (default eth0).
+//! - `STREAMGUARD_TUN_ADDR`     IPv4 address for the gateway TUN (default
+//!   10.0.85.1, spec 26.5; override only to dodge a client-address clash
+//!   during same-host real testing).
 //! - `STREAMGUARD_DEV`          any value -> in-memory TUN fallback.
 
 use std::path::{Path, PathBuf};
@@ -73,7 +76,11 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("streamguard-gateway starting");
 
-    let tun_cfg = TunConfig::default();
+    let tun_cfg = TunConfig {
+        address: std::env::var("STREAMGUARD_TUN_ADDR")
+            .unwrap_or_else(|_| String::from("10.0.85.1")),
+        ..TunConfig::default()
+    };
     let tun: Box<dyn Tun> = match sg_tun::create(&tun_cfg) {
         Ok(tun) => tun,
         Err(err) if std::env::var_os("STREAMGUARD_DEV").is_some() => {

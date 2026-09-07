@@ -29,6 +29,16 @@ pub trait PathTransport: Send + Sync {
     /// transports may treat it as a no-op. Used to simulate or force a
     /// physical path loss so the health engine and scheduler can fail over.
     fn close(&self) {}
+
+    /// Estimated achievable upload throughput in kilobits/sec (spec 13
+    /// "estimated available throughput"). `None` when the transport cannot
+    /// produce an estimate yet (e.g. mid-handshake, or a scaffold transport).
+    /// Real QUIC implementations derive this from the congestion window and
+    /// RTT (bandwidth-delay product); synthesized transports leave it as the
+    /// default `None` (the health engine then reports kbps unmeasured).
+    fn available_kbps(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Identifies a session at the gateway after the mTLS + token exchange.

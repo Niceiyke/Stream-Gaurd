@@ -826,6 +826,26 @@ async fn probe_loop(
         }
         counters.lock().await.probes_sent += 1;
 
+        // Sample the path's achievable throughput from its congestion state
+        // (bandwidth-delay product, spec 13 "estimated available throughput").
+        // qck's cwnd/rtt is the non-intrusive estimate; a light EWMA (alpha
+        // 1/4) keeps the dashboard stable while still tracking collapse.
+        if let Some(kbps) = transport.available_kbps() {
+            let kbps = kbps.min(u32::MAX as u64) as u32;
+            let mut m = shared.metrics.lock().await;
+            let entry = m
+                .entry(path_id)
+                .or_insert(PathMetrics {
+                    reachable: true,
+                    ..Default::default()
+                });
+            entry.available_kbps = if entry.available_kbps == 0 {
+                kbps
+            } else {
+                (3 * entry.available_kbps + kbps) / 4
+            };
+        }
+
         // Count unanswered probes older than the window as lost.
         let (lost, total_misses) = {
             let mut pending = shared.pending_probes.lock().await;

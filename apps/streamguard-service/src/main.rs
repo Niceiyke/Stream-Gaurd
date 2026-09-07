@@ -16,7 +16,13 @@
 //!   — matches the gateway's generated cert).
 //! - `STREAMGUARD_DEV`         any value -> in-memory TUN dev simulation
 //!   instead of bailing when the native adapter is unavailable.
-//! - `WINTUN_DLL`              optional path override passed to tun-rs
+//! - `STREAMGUARD_PRINT_TICKET` any value -> log the bootstrap ticket and
+//!   drop the TEMP hint like dev does (opt-in convenience for the run-real
+//!   launcher; never on in production).
+//! - `STREAMGUARD_TUN_ADDR`     IPv4 address for this host's TUN adapter
+//!   (default 10.0.85.1; the real launcher assigns the client 10.0.85.2 so
+//!   one host can ride gateway + client without an address clash).
+//! - `WINTUN_DLL`               optional path override passed to tun-rs
 //!   (Windows only; otherwise `wintun.dll` is loaded from the working dir).
 //! - `STREAMGUARD_PIPE`        status-server named pipe (Windows; default
 //!   `\\.\pipe\streamguard-status`). Non-Windows hosts use loopback TCP
@@ -116,7 +122,9 @@ async fn main() -> anyhow::Result<()> {
     );
     // Dev simulation prints the ticket once so a local status shell can be
     // launched with `--token <this>`; production never logs the token value.
-    if std::env::var_os("STREAMGUARD_DEV").is_some() {
+    // `STREAMGUARD_PRINT_TICKET` opts the real launcher (`run-real.ps1 -Shell`)
+    // into the same convenience — still never default-on.
+    if std::env::var_os("STREAMGUARD_DEV").is_some() || std::env::var_os("STREAMGUARD_PRINT_TICKET").is_some() {
         let prefix = streamguard_service::status::session_prefix(session);
         tracing::info!("dev status-shell ticket: {token}");
         // Also drop credential hints in TEMP so `run-dev.ps1 -Shell` can
@@ -190,7 +198,13 @@ async fn main() -> anyhow::Result<()> {
     // --- TUN (spec 22.5) -------------------------------------------------
     // The engine drives real adapters from a dedicated OS thread; without
     // `native-tun` or a driver the binary only runs in dev simulation.
-    let tun_cfg = TunConfig::default();
+    // `STREAMGUARD_TUN_ADDR` lets the real launcher give the client side of
+    // the tunnel its own address on the gateway subnet (spec 26.5).
+    let tun_cfg = TunConfig {
+        address: std::env::var("STREAMGUARD_TUN_ADDR")
+            .unwrap_or_else(|_| String::from("10.0.85.1")),
+        ..TunConfig::default()
+    };
     let tun = match sg_tun::create(&tun_cfg) {
         Ok(tun) => tun,
         Err(err) if std::env::var_os("STREAMGUARD_DEV").is_some() => {

@@ -112,7 +112,7 @@ function render(snapshot) {
       const srtt = p.srtt_ms === undefined ? "—" : p.srtt_ms;
       const jitter = p.jitter_ms === undefined ? "—" : p.jitter_ms;
       const loss = p.loss === undefined ? "—" : (p.loss * 100).toFixed(1);
-      const kbps = p.available_kbps === undefined ? "—" : p.available_kbps;
+      const kbps = p.available_kbps ? p.available_kbps : "—";
       const stab = p.stability_secs === undefined ? "—" : p.stability_secs;
       tr.innerHTML =
         `<td><span class="badge badge-path">path ${p.path_id}</span></td>` +
