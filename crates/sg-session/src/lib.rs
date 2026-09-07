@@ -13,11 +13,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use sg_core::error::{Error, Result};
 use sg_core::{PathId, Sequence, SessionId};
-use sg_multipath::{ReorderBuffer, Sequencer};
+use sg_multipath::{Decision, ReorderBuffer, Sequencer, WeightedBondingScheduler};
 use sg_protocol::Envelope;
 use sg_transport::PathTransport;
 
@@ -32,6 +33,20 @@ pub fn session_id_from_wire(prefix: u32) -> SessionId {
     SessionId::from_bytes(b)
 }
 
+/// Adopted phase-3 downlink-bonding state (spec 12 Phase 3, gateway side).
+///
+/// The client owns the authoritative health snapshot and *publishes* the
+/// normalized per-path weights via `Control::WeightSet`; the gateway mirrors
+/// that distribution for its downlink egress with the same smooth-WRR
+/// scheduler the client's uplink uses. `advertised_at` arms a TTL so a stale
+/// advertisement (client died mid-session, weights no longer refreshed)
+/// deterministically falls back to the phase-1 `active_path`.
+#[derive(Debug)]
+struct DownlinkBonds {
+    scheduler: WeightedBondingScheduler,
+    expires_at: Instant,
+}
+
 /// Per-session path and sequencing state. Used symmetrically by the client
 /// (one session, several paths) and the gateway (many sessions, demuxed).
 pub struct Session {
@@ -40,6 +55,7 @@ pub struct Session {
     reorder: ReorderBuffer,
     paths: HashMap<PathId, Arc<dyn PathTransport>>,
     active_path: Option<PathId>,
+    downlink: Option<DownlinkBonds>,
 }
 
 impl Session {
@@ -50,6 +66,7 @@ impl Session {
             reorder: ReorderBuffer::new(128),
             paths: HashMap::new(),
             active_path: None,
+            downlink: None,
         }
     }
 
@@ -104,12 +121,30 @@ impl Session {
     /// not strand the session: if the removed path was active, the session
     /// falls back to the lowest remaining path id so the downlink keeps
     /// flowing on a standby. Returns true when the path was bound.
+    ///
+    /// Adopted downlink weights are pruned in lockstep — a dead path must
+    /// never be scheduled by the phase-3 mirror — and if no bound path keeps
+    /// weight the whole bond is dropped and the downlink falls back to
+    /// `active_path`.
     pub fn remove_path(&mut self, path_id: PathId) -> bool {
         if self.paths.remove(&path_id).is_none() {
             return false;
         }
         if self.active_path == Some(path_id) {
             self.active_path = self.paths.keys().map(|p| p.get()).min().map(PathId::new);
+        }
+        if let Some(bonds) = self.downlink.as_mut() {
+            let kept: Vec<(u8, f32)> = bonds
+                .scheduler
+                .normalized_weights()
+                .into_iter()
+                .filter(|(p, _)| self.paths.contains_key(&PathId::new(*p)))
+                .collect();
+            if kept.is_empty() {
+                self.downlink = None;
+            } else {
+                bonds.scheduler.adopt_weights(kept);
+            }
         }
         true
     }
@@ -132,6 +167,60 @@ impl Session {
 
     pub fn pending_incoming(&self) -> usize {
         self.reorder.pending()
+    }
+
+    // -- Phase-3 downlink bonding mirror (spec 12 Phase 3) ----------------
+
+    /// Adopts the client's advertised downlink weights for `ttl` (a stale
+    /// advertisement deterministically falls back to `active_path`). Entries
+    /// for unbound paths are ignored — a `WeightSet` can arrive racing an
+    /// eviction — and the surviving vector is re-normalized defensively.
+    /// Returns the number of bound, positive-weight entries adopted
+    /// (0 when nothing was applied).
+    pub fn adopt_downlink_weights(&mut self, weights: Vec<(PathId, f32)>, ttl: Duration) -> usize {
+        let adopted: Vec<(u8, f32)> = weights
+            .into_iter()
+            .filter(|(p, w)| self.paths.contains_key(p) && w.is_finite() && *w > 0.0)
+            .map(|(p, w)| (p.get(), w))
+            .collect();
+        let n = adopted.len();
+        if n > 0 {
+            let bonds = self.downlink.get_or_insert_with(|| DownlinkBonds {
+                scheduler: WeightedBondingScheduler::default(),
+                expires_at: Instant::now(),
+            });
+            bonds.scheduler.adopt_weights(adopted);
+            bonds.expires_at = Instant::now() + ttl;
+        } else {
+            self.downlink = None;
+        }
+        n
+    }
+
+    /// True while the last adopted weight set is still fresh. The client
+    /// re-advertises on every material change; the TTL is the safety valve
+    /// that reverts the gateway to phase-1 active/standby when the client
+    /// goes quiet.
+    pub fn downlink_weights_fresh(&self) -> bool {
+        self.downlink
+            .as_ref()
+            .is_some_and(|b| b.expires_at > Instant::now())
+    }
+
+    /// Smooth-WRR egress decision from the adopted downlink weights (the
+    /// same `WeightedBondingScheduler::decide` the client's uplink runs),
+    /// or `None` when no fresh weight set exists — the caller then falls
+    /// back to `active_path` exactly as before the advertisement.
+    pub fn downlink_decide(&mut self) -> Option<PathId> {
+        let bonds = self.downlink.as_mut()?;
+        if bonds.expires_at <= Instant::now() {
+            self.downlink = None;
+            return None;
+        }
+        match bonds.scheduler.decide() {
+            Decision::Send { path } => Some(PathId::new(path)),
+            Decision::Skip | Decision::Duplicate { .. } => None,
+        }
     }
 
     /// Sends an envelope out the currently active path.
@@ -312,5 +401,96 @@ mod tests {
         let mut reader = wire.freeze();
         let decoded = Envelope::decode(&mut reader).unwrap();
         assert_eq!(decoded.session_id, id, "wire truncation is lossless for wire-safe ids");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase-3 downlink bonding mirror (spec 12 Phase 3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn adopted_weights_decide_and_prune_with_path_removal() {
+        let mut session = Session::new(session_id_from_wire(1));
+        let a1 = PathId::new(1);
+        let a2 = PathId::new(2);
+        session.add_path(Arc::new(NoopTransport), a1).unwrap();
+        session.add_path(Arc::new(NoopTransport), a2).unwrap();
+
+        assert!(!session.downlink_weights_fresh(), "no advertisement yet");
+        assert_eq!(session.downlink_decide(), None, "no bond -> fall back to active");
+        assert_eq!(session.active_path(), Some(a1), "fallback path is the active one");
+
+        // Adopt an asymmetric 3:1 distribution; the mirror schedules both.
+        let adopted = session.adopt_downlink_weights(
+            vec![(a1, 0.75), (a2, 0.25), (PathId::new(9), 1.0)],
+            Duration::from_secs(60),
+        );
+        assert_eq!(adopted, 2, "unbound path 9 is filtered out");
+        assert!(session.downlink_weights_fresh());
+
+        let mut hits = [0u64; 2];
+        for _ in 0..12 {
+            match session.downlink_decide() {
+                Some(p) if p == a1 => hits[0] += 1,
+                Some(p) if p == a2 => hits[1] += 1,
+                other => panic!("unexpected downlink decision {other:?}"),
+            }
+        }
+        assert!(hits[0] > 0 && hits[1] > 0, "both paths receive downlink work");
+        assert!(
+            (hits[0] as f32 / hits[1] as f32 - 3.0).abs() <= 0.5,
+            "empirical ratio tracks the adopted 3:1 weights: {hits:?}"
+        );
+
+        // Evict the high-weight path: the mirror must not schedule it again.
+        assert!(session.remove_path(a1));
+        assert_eq!(
+            session.active_path(),
+            Some(a2),
+            "active falls back to the lowest remaining"
+        );
+        for _ in 0..8 {
+            assert_eq!(
+                session.downlink_decide(),
+                Some(a2),
+                "pruned bond schedules only the surviving path"
+            );
+        }
+
+        // Evict the last weighted path: the bond collapses and the callers
+        // fall back to active_path.
+        assert!(session.remove_path(a2));
+        assert_eq!(session.downlink_decide(), None);
+    }
+
+    #[test]
+    fn stale_weights_are_dropped_and_re_adopted() {
+        let mut session = Session::new(session_id_from_wire(1));
+        let a1 = PathId::new(1);
+        session.add_path(Arc::new(NoopTransport), a1).unwrap();
+
+        // Adopt with a TTL that is already expired: nothing is scheduled.
+        session.adopt_downlink_weights(vec![(a1, 1.0)], Duration::ZERO);
+        assert!(!session.downlink_weights_fresh());
+        assert_eq!(session.downlink_decide(), None);
+
+        // A fresh advertisement re-arms the mirror.
+        session.adopt_downlink_weights(vec![(a1, 1.0)], Duration::from_secs(60));
+        assert!(session.downlink_weights_fresh());
+        assert_eq!(session.downlink_decide(), Some(a1));
+    }
+
+    #[test]
+    fn adopt_replaces_the_previous_distribution() {
+        let mut session = Session::new(session_id_from_wire(1));
+        let a1 = PathId::new(1);
+        let a2 = PathId::new(2);
+        session.add_path(Arc::new(NoopTransport), a1).unwrap();
+        session.add_path(Arc::new(NoopTransport), a2).unwrap();
+
+        session.adopt_downlink_weights(vec![(a1, 1.0), (a2, 0.0)], Duration::from_secs(60));
+        assert_eq!(session.downlink_decide(), Some(a1), "zero-weight entry dropped");
+
+        session.adopt_downlink_weights(vec![(a2, 1.0)], Duration::from_secs(60));
+        assert_eq!(session.downlink_decide(), Some(a2), "re-adoption replaces the bond");
     }
 }

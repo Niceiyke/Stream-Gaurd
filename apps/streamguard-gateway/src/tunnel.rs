@@ -31,6 +31,16 @@ use sg_tun::Tun;
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 
+/// How long an adopted `Control::WeightSet` stays authoritative before the
+/// downlink falls back to the phase-1 `active_path` (spec 12 Phase 3).
+///
+/// The client owns the health snapshot and re-advertises the downlink
+/// weights on every material change (its default probe cadence is 1 Hz,
+/// spec 31.3), so a 10 s TTL covers roughly ten refresh cycles as slack and
+/// still reverts the downlink to plain active/standby deterministically if
+/// the client goes quiet mid-session.
+const DOWNLINK_WEIGHT_TTL: Duration = Duration::from_secs(10);
+
 /// Counters exposed to tests after the engine runs. `authenticated_paths`
 /// counts connections that completed the v1 bootstrap handshake; paths that
 /// never authenticated are not added to any session or to `paths`.
@@ -52,12 +62,20 @@ pub struct Counters {
     pub keepalives: u64,
     /// `Control::PathSelect` messages applied (downlink moved to a new path).
     pub path_selects: u64,
+    /// `Control::WeightSet` advertisements applied (downlink egress spread
+    /// by the client's phase-3 weights, spec 12 Phase 3).
+    pub weight_sets: u64,
     /// Paths removed from sessions because their QUIC connection died. The
     /// session falls back to a surviving path (see `Session::remove_path`).
     pub paths_evicted: u64,
     /// Health probes answered with a `PathStatus` reply (per-path cadence
     /// the client's liveness monitor keys on).
     pub probes_replied: u64,
+    /// Per-path counts of the downlink `Data` envelope sent (phase 3
+    /// weighted bonding distribution, spec 12 Phase 3). Duplicates and
+    /// control traffic are not counted here — this is the scheduler's
+    /// egress distribution, not the wire total.
+    pub downlink: std::collections::HashMap<PathId, u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -375,10 +393,8 @@ async fn reader_loop<T: Tun + Send + 'static>(
             }
             // Rev1 path control: the client picked a new active path; move the
             // downlink for its session there (fire-and-forget datagram).
-            PacketType::Control => {
-                if let Ok(ControlMsg::PathSelect { path }) =
-                    ControlMsg::decode(&envelope.payload)
-                {
+            PacketType::Control => match ControlMsg::decode(&envelope.payload) {
+                Ok(ControlMsg::PathSelect { path }) => {
                     let applied = {
                         let mut sessions = sessions.lock().await;
                         match sessions.session_mut(envelope.session_id) {
@@ -396,7 +412,35 @@ async fn reader_loop<T: Tun + Send + 'static>(
                         );
                     }
                 }
-            }
+                Ok(ControlMsg::WeightSet { weights }) => {
+                    // Phase-3 downlink mirror (spec 12 Phase 3): the client
+                    // owns the health snapshot and advertises the per-path
+                    // distribution; the session adopts it so `downlink_decide`
+                    // spreads its egress with the same smooth-WRR scheduler
+                    // the client's uplink uses. Unbound paths are filtered
+                    // out by the session, so a WeightSet racing an eviction
+                    // can never schedule a dead path.
+                    let adopted = {
+                        let mut sessions = sessions.lock().await;
+                        match sessions.session_mut(envelope.session_id) {
+                            Some(s) => s.adopt_downlink_weights(weights, DOWNLINK_WEIGHT_TTL),
+                            None => 0,
+                        }
+                    };
+                    if adopted > 0 {
+                        counters.lock().await.weight_sets += 1;
+                    } else {
+                        tracing::debug!(
+                            ?envelope.session_id,
+                            "weight set ignored: no bound path carries weight yet"
+                        );
+                    }
+                }
+                Ok(other) => {
+                    tracing::debug!(msg = ?other, "unhandled gateway control message");
+                }
+                Err(_) => {} // malformed control payloads are dropped
+            },
             PacketType::Keepalive => {
                 counters.lock().await.keepalives += 1;
             }
@@ -520,20 +564,27 @@ async fn downlink_loop<T: Tun + Send + 'static>(
             }
         };
 
-        // Sequence + active path.
-        let seq_and_path = {
+        // Sequence + egress path. With a fresh phase-3 weight advertisement
+        // (spec 12 Phase 3) the same smooth-WRR scheduler that spreads the
+        // client's uplink picks the per-frame egress path; otherwise the
+        // phase-1 `active_path` (set by `Control::PathSelect`) is used
+        // exactly as before — raw path-control tests that never advertise
+        // weights keep the single-path behaviour unchanged.
+        let (seq, path_id) = {
             let mut sessions = sessions.lock().await;
             let session = match sessions.session_mut(sid) {
                 Some(s) => s,
                 None => continue,
             };
             let seq = session.next_sequence();
-            match session.active_path() {
+            match session.downlink_decide() {
                 Some(p) => (seq, p),
-                None => continue,
+                None => match session.active_path() {
+                    Some(p) => (seq, p),
+                    None => continue,
+                },
             }
         };
-        let (seq, path_id) = seq_and_path;
 
         let env = Envelope {
             version: VERSION,
@@ -554,7 +605,9 @@ async fn downlink_loop<T: Tun + Send + 'static>(
             }
         };
         if sent {
-            counters.lock().await.datagrams_to_client += 1;
+            let mut c = counters.lock().await;
+            c.datagrams_to_client += 1;
+            *c.downlink.entry(path_id).or_insert(0) += 1;
         }
     }
 }

@@ -66,6 +66,11 @@ struct Shared {
     /// shared health snapshot in the uplink loop and decides the per-packet
     /// path by normalized weight.
     scheduler: Mutex<WeightedBondingScheduler>,
+    /// The weight distribution last published to the gateway via
+    /// `Control::WeightSet` (phase-3 downlink mirror). `None` before the
+    /// first advertisement; the material-change gate mirrors `notified` for
+    /// `PathSelect` so the steady state does not spam the control channel.
+    notified_weights: Mutex<Option<Vec<(u8, f32)>>>,
 }
 
 /// Aggregate counters exposed to tests after the engine runs.
@@ -97,6 +102,9 @@ pub struct Counters {
     /// bonding distribution, spec 12 Phase 3). Duplicates are not counted
     /// here — this is the scheduler's send distribution, not the wire total.
     pub uplink: std::collections::HashMap<PathId, u64>,
+    /// `Control::WeightSet` messages sent publishing the phase-3 downlink
+    /// weights to the gateway (spec 12 Phase 3 downlink mirror).
+    pub weight_sets: u64,
 }
 
 /// A running client engine. Call `stop` to tear it down.
@@ -235,6 +243,7 @@ pub async fn start<T: Tun + Send + 'static>(
         probe_misses: Mutex::new(HashMap::new()),
         redundancy_loss_threshold: options.redundancy_loss_threshold,
         scheduler: Mutex::new(WeightedBondingScheduler::default()),
+        notified_weights: Mutex::new(None),
     });
 
     // Spawn one downlink reader per bound path, one keepalive task if a
@@ -482,6 +491,103 @@ async fn announce_path(
     }
 }
 
+/// Material-change tolerance for re-advertising downlink weights: an entry
+/// must move by more than this (or the set's membership must change) to
+/// justify a new `WeightSet`. Mirrors `announce_path`'s idempotence gate so
+/// the continuous weight updates (spec 12 Phase 3 "adjust weights
+/// continuously") do not spam the control channel per update.
+const WEIGHT_REFRESH_DELTA: f32 = 0.02;
+
+/// True when the *next* distribution differs from the last advertised one
+/// beyond the refresh tolerance. Both vectors come from
+/// `normalized_weights` and are sorted by path id, so a pairwise zip is a
+/// faithful comparison.
+fn weights_changed(prev: Option<&[(u8, f32)]>, next: &[(u8, f32)]) -> bool {
+    match prev {
+        None => true,
+        Some(prev) => {
+            prev.len() != next.len()
+                || prev
+                    .iter()
+                    .zip(next.iter())
+                    .any(|((p, a), (q, b))| p != q || (a - b).abs() > WEIGHT_REFRESH_DELTA)
+        }
+    }
+}
+
+/// Publishes the phase-3 downlink weights to the gateway (spec 12 Phase 3
+/// mirror): the client owns the authoritative health snapshot, so it
+/// advertises the normalized per-path distribution and the gateway spreads
+/// its downlink egress with the same smooth-WRR scheduler used here.
+///
+/// Mirrors `announce_path` conventions: fire-and-forget datagram on the
+/// preferred path, gated on material change via `Shared.notified_weights`.
+/// With fewer than two weighted paths the phase-1 `PathSelect` control
+/// already steers the downlink, so nothing is sent (single-path egress must
+/// stay indistinguishable from today's active/standby behaviour).
+async fn advertise_weights(shared: &Arc<Shared>, counters: &Arc<Mutex<Counters>>, session_id: SessionId) {
+    // Snapshot the current distribution. Lock order honours the
+    // session→metrics convention: the session lock is acquired before
+    // metrics → scheduler.
+    let (weights, preferred) = {
+        let session = shared.session.lock().await;
+        let current = session.active_path();
+        let paths: Vec<PathId> = session.path_ids().collect();
+        let metrics = shared.metrics.lock().await;
+        let mut sched = shared.scheduler.lock().await;
+        sched.update_from(paths.iter().copied(), &metrics);
+        let preferred = sched.preferred_path(current);
+        (sched.normalized_weights(), preferred)
+    };
+    if weights.len() < 2 {
+        // Active/standby: `PathSelect` already carries the downlink
+        // steering; publishing a single-path weight set adds wire noise.
+        return;
+    }
+    let Some(preferred) = preferred else {
+        return; // no weighted path -> nothing to publish
+    };
+    let changed = {
+        let mut notified = shared.notified_weights.lock().await;
+        if weights_changed(notified.as_deref(), &weights) {
+            *notified = Some(weights.clone());
+            true
+        } else {
+            false
+        }
+    };
+    if !changed {
+        return;
+    }
+    let ctrl = Envelope {
+        version: VERSION,
+        packet_type: PacketType::Control,
+        flags: 0,
+        path_id: preferred,
+        session_id,
+        sequence: sg_core::Sequence::new(0),
+        timestamp_ms: 0,
+        payload: ControlMsg::WeightSet {
+            weights: weights
+                .into_iter()
+                .map(|(p, w)| (PathId::new(p), w))
+                .collect(),
+        }
+        .encode()
+        .expect("weight set never exceeds u16::MAX"),
+    };
+    if shared
+        .session
+        .lock()
+        .await
+        .send_on(preferred, ctrl)
+        .await
+        .is_ok()
+    {
+        counters.lock().await.weight_sets += 1;
+    }
+}
+
 /// Marks `dead` unreachable and triggers failover (spec 31.4).
 ///
 /// A transport-level failure (connection loss on `recv`, or a failed
@@ -532,6 +638,10 @@ async fn fail_path(shared: Arc<Shared>, counters: Arc<Mutex<Counters>>, dead: Pa
     if let Some(next) = promotion {
         let sid = shared.session.lock().await.session_id();
         announce_path(&shared, &counters, next, sid).await;
+        // The dead path just dropped out of the distribution (weight 0):
+        // re-publish so the gateway's downlink mirror stops scheduling it
+        // immediately instead of waiting out the weight TTL.
+        advertise_weights(&shared, &counters, sid).await;
     }
 }
 
@@ -705,6 +815,12 @@ async fn uplink_loop<T: Tun + Send + 'static>(
             // changes (fire-and-forget datagram). The gateway steers its
             // downlink replies from this; bonding only spreads the uplink.
             announce_path(&shared, &counters, preferred, session_id).await;
+            // Phase-3 downlink mirror: publish the current weight
+            // distribution so the gateway spreads its downlink egress the
+            // same way this scheduler spreads the uplink. Gated on material
+            // change (and on there being ≥2 weighted paths) by
+            // `advertise_weights` itself.
+            advertise_weights(&shared, &counters, session_id).await;
         }
 
         let env = Envelope {

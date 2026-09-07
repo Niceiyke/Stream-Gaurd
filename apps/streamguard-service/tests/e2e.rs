@@ -574,3 +574,179 @@ async fn client_bonds_two_healthy_paths_by_weight() {
     gw.stop().await;
     host_task.abort();
 }
+
+/// Spec 12 Phase 3 DOWNLINK mirror: the client owns the authoritative
+/// health snapshot and *advertises* the normalized per-path weights; the
+/// gateway adopts the `Control::WeightSet` and spreads its downlink egress
+/// with the same smooth-WRR scheduler the client's uplink uses.
+///
+/// Asymmetric weights across two healthy paths, N host replies: every reply
+/// is sequenced by the shared per-session sequencer and distributed across
+/// both paths proportional to weight, the client's reorder window
+/// reassembles the interleaved arrivals in order with zero drops, and the
+/// single-path active/standby fallback stays regression-free.
+#[tokio::test]
+async fn gateway_bonds_downlink_across_two_paths_by_advertised_weight() {
+    let (cert_der, key_der) = {
+        let c = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        (c.cert.der().to_vec(), c.key_pair.serialize_der())
+    };
+    let server_cfg = server_tls(&cert_der, &key_der).unwrap();
+    let client_cfg = client_tls(&cert_der).unwrap();
+    let gateway = GatewayQuic::bind("127.0.0.1:0".parse().unwrap(), server_cfg).unwrap();
+    let addr = gateway.local_addr().unwrap();
+
+    let secret = b"downlink-bonding-test-secret".to_vec();
+    let host_tun = LoopbackTun::with_config(TunConfig {
+        name: "sg-wan0".into(),
+        address: "192.168.1.1".into(),
+        prefix_len: 24,
+        mtu: 1300,
+    });
+    let mut gw = tunnel::start(host_tun, gateway, secret.clone()).await;
+    let host_task = tokio::spawn(host_echo(gw.tun.clone()));
+
+    let client_tun = LoopbackTun::with_config(TunConfig {
+        name: "sg-lan0".into(),
+        address: "10.0.85.1".into(),
+        prefix_len: 24,
+        mtu: 1300,
+    });
+    let session = session_id_from_wire(0xd0d0d0d0);
+    let token = sg_auth::issue(&secret, session, 3600);
+    let mut client = client::start(
+        client_tun,
+        client::ClientOptions {
+            addr,
+            server_name: "localhost".into(),
+            client_config: client_cfg,
+            // Keepalives/probes parked so every counter below is attributable
+            // to the bonding batch; duplication disabled so the scheduler's
+            // distribution is the only traffic on the wire.
+            keepalive_interval: Duration::from_secs(3600),
+            probe_interval: Duration::from_secs(3600),
+            probe_timeout: Duration::from_secs(3600),
+            probe_failure_threshold: 2,
+            redundancy_loss_threshold: 0.0,
+        },
+        session,
+        &[PathId::new(1), PathId::new(2)],
+        &token,
+    )
+    .await
+    .unwrap();
+    sleep(Duration::from_millis(150)).await;
+
+    // Both paths healthy but asymmetric (same picture as the uplink bonding
+    // test): path 1 is fast/clean/high-capacity, path 2 slower and lossier.
+    // Both stay under the 20% eligibility cliff, so the phase-3 weights stay
+    // lopsided (~2.3:1) instead of collapsing to a single path.
+    let p1 = PathId::new(1);
+    let p2 = PathId::new(2);
+    client
+        .set_metrics(
+            p1,
+            PathMetrics {
+                reachable: true,
+                srtt_ms: 20,
+                loss: 0.01,
+                available_kbps: 50_000,
+                ..Default::default()
+            },
+        )
+        .await;
+    client
+        .set_metrics(
+            p2,
+            PathMetrics {
+                reachable: true,
+                srtt_ms: 90,
+                loss: 0.10,
+                available_kbps: 4_000,
+                ..Default::default()
+            },
+        )
+        .await;
+
+    // A batch of host frames. Each leaves the client with its own sequence
+    // (uplink spread by weight), is echoed by the host, and each reply gets
+    // its OWN downlink sequence plus an egress path from the ADVERTISED
+    // weights (spec 11.2: one per-session sequencer regardless of path).
+    let n: usize = 16;
+    for i in 0..n {
+        let id = 0x2001u16 + i as u16;
+        client
+            .tun
+            .lock()
+            .await
+            .enqueue(Bytes::from(icmp_request([10, 0, 85, 2], [8, 8, 8, 8], id)));
+    }
+
+    // Every reply must round-trip through the bonded downlink: the client's
+    // reorder window reassembles the interleaved arrivals in sequence order.
+    let mut delivered = false;
+    for _ in 0..150 {
+        if client.counters().await.frames_to_host as usize == n {
+            delivered = true;
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(delivered, "all {n} replies delivered to the client TUN");
+
+    let cc = client.counters().await;
+    assert_eq!(
+        cc.datagrams_to_gateway as usize,
+        n,
+        "no duplicates, no lost requests"
+    );
+    assert_eq!(cc.duplicates_dropped, 0, "client reorder window saw no drop");
+    assert!(
+        cc.weight_sets >= 1,
+        "the client advertised the phase-3 downlink weights"
+    );
+
+    let gwc = gw.counters().await;
+    assert_eq!(
+        gwc.frames_to_host as usize,
+        n,
+        "gateway forwarded every request in order"
+    );
+    assert_eq!(
+        gwc.datagrams_to_client as usize,
+        n,
+        "gateway sent every reply"
+    );
+    assert_eq!(gwc.duplicates_dropped, 0, "gateway reorder window saw no drop");
+    assert!(
+        gwc.weight_sets >= 1,
+        "the gateway adopted the advertised weights"
+    );
+
+    // The bonding egress proof: the per-path `downlink` counter shows the
+    // spread, proportional to the advertised weight ratio.
+    let d1 = *gwc.downlink.get(&p1).unwrap_or(&0);
+    let d2 = *gwc.downlink.get(&p2).unwrap_or(&0);
+    assert_eq!(d1 + d2, n as u64, "every reply is accounted for on a path");
+    assert!(
+        d1 > 0 && d2 > 0,
+        "downlink bonding spread replies across BOTH paths (p1={d1}, p2={d2})"
+    );
+    assert!(d1 > d2, "the faster path carries the larger share (p1={d1}, p2={d2})");
+    let ratio12 = d1 as f32 / d2 as f32;
+    assert!(
+        (1.2..=3.5).contains(&ratio12),
+        "downlink share ratio {ratio12} tracks the ~2.3:1 weight ratio (p1={d1}, p2={d2})"
+    );
+
+    let frames = client.tun.lock().await.drain_outbound();
+    assert_eq!(
+        frames.len(),
+        n,
+        "all {n} echoed replies are in the client TUN"
+    );
+
+    client.stop().await;
+    gw.stop().await;
+    host_task.abort();
+}

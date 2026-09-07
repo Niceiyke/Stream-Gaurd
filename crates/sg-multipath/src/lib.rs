@@ -115,6 +115,36 @@ impl WeightedBondingScheduler {
         w
     }
 
+    /// Adopts an externally-published normalized weight distribution directly.
+    ///
+    /// Used by the gateway's phase-3 downlink mirror (spec 12 Phase 3): the
+    /// *client* owns the authoritative health snapshot and advertises the
+    /// per-path weights; this scheduler mirrors that distribution without
+    /// recomputing from its own metrics (the gateway runs no probes). The
+    /// adopted vector is re-normalized defensively — the advertisement rides
+    /// the public wire — and non-finite/zero/negative entries are dropped.
+    /// Smooth-WRR accumulators persist, so the interleave stays continuous
+    /// across re-adoptions.
+    pub fn adopt_weights(&mut self, weights: impl IntoIterator<Item = (u8, f32)>) {
+        self.metrics.clear();
+        self.weights.clear();
+        let mut total = 0.0f32;
+        for (p, w) in weights {
+            if w.is_finite() && w > 0.0 {
+                self.weights.insert(p, w);
+                total += w;
+            }
+        }
+        if total.is_finite() && total > 0.0 {
+            for w in self.weights.values_mut() {
+                *w /= total;
+            }
+            self.total_weight = 1.0;
+        } else {
+            self.total_weight = 0.0;
+        }
+    }
+
     /// The preferred (highest-weight) eligible path — the active/downlink
     /// preference. Ties keep the currently active path, falling back to the
     /// lowest path id, so a tie never triggers a spurious `PathSelect`.
@@ -639,5 +669,69 @@ mod tests {
         assert!(sched.normalized_weights().is_empty());
         assert_eq!(sched.decide(), Decision::Skip);
         assert_eq!(sched.preferred_path(None), None);
+    }
+
+    #[test]
+    fn adopted_weights_are_renormalized_and_defensively_filtered() {
+        // Gateway downlink mirror: the advertised vector is treated as
+        // untrusted input and re-normalized before anything is scheduled.
+        let mut sched = WeightedBondingScheduler::default();
+        sched.adopt_weights([
+            (1, 8.0),   // dominant path
+            (2, 2.0),   // minor path
+            (3, 0.0),   // zero weight dropped
+            (4, -1.0),  // negative weight dropped
+            (5, f32::NAN),
+            (6, f32::INFINITY),
+        ]);
+
+        let w = sched.normalized_weights();
+        assert_eq!(w.len(), 2, "only positive finite entries survive adoption");
+        let sum: f32 = w.iter().map(|(_, w)| w).sum();
+        assert!((sum - 1.0).abs() < 1e-4, "adopted weights are re-normalized");
+        assert!((w[0].1 - 0.8).abs() < 1e-4, "path 1 keeps its 4:1 dominance");
+        assert!((w[1].1 - 0.2).abs() < 1e-4, "path 2 keeps its 1:4 share");
+    }
+
+    #[test]
+    fn adopted_weights_distribute_and_survive_re_adoption() {
+        // 3:1 adoption across two paths: WRR must hit both and re-adopting
+        // the same vector (client re-advertisement cadence) must not disturb
+        // the interleave.
+        let mut sched = WeightedBondingScheduler::default();
+        for _ in 0..3 {
+            sched.adopt_weights([(1, 3.0), (2, 1.0)]);
+            let mut hits = [0u64; 2];
+            for _ in 0..8 {
+                match sched.decide() {
+                    Decision::Send { path: 1 } => hits[0] += 1,
+                    Decision::Send { path: 2 } => hits[1] += 1,
+                    other => panic!("unexpected bonding decision {other:?}"),
+                }
+            }
+            assert!(hits[0] > 0 && hits[1] > 0, "both adopted paths receive work");
+            assert_eq!(hits[0] + hits[1], 8);
+            assert!(
+                (hits[0] as f32 / hits[1] as f32 - 3.0).abs() <= 0.5,
+                "empirical ratio tracks the adopted 3:1 weights: {:?}",
+                hits
+            );
+        }
+    }
+
+    #[test]
+    fn adopting_empty_weights_skips_until_new_weights_arrive() {
+        let mut sched = WeightedBondingScheduler::default();
+        sched.adopt_weights([(1, 1.0)]);
+        assert_eq!(sched.decide(), Decision::Send { path: 1 });
+
+        // A stale/empty advertisement must leave nothing schedulable...
+        sched.adopt_weights([]);
+        assert_eq!(sched.decide(), Decision::Skip);
+        assert!(sched.normalized_weights().is_empty());
+
+        // ...until a fresh one re-arms the scheduler.
+        sched.adopt_weights([(2, 1.0)]);
+        assert_eq!(sched.decide(), Decision::Send { path: 2 });
     }
 }
