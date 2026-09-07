@@ -99,13 +99,25 @@ async fn main() -> anyhow::Result<()> {
                 .context("STREAMGUARD_SESSION must be hex, e.g. 0xfeedbeef")?;
             session_id_from_wire(prefix)
         }
-        Err(_) => SessionId::new(),
+        Err(_) => {
+            // Only the 4-byte wire prefix crosses the tunnel (spec 3), so the
+            // full id must be zero-tailed (`session_id_from_wire`) or the
+            // gateway's accredited id never matches ours. Derive a random
+            // prefix from a fresh id and rebuild it zero-tailed.
+            session_id_from_wire(streamguard_service::status::session_prefix(SessionId::new()))
+        }
     };
     let token = sg_auth::issue(secret.as_bytes(), session, 3600);
     tracing::info!(
         session_prefix = %format!("{:08x}", streamguard_service::status::session_prefix(session)),
+        token_len = token.len(),
         "bootstrap ticket minted (1h TTL)"
     );
+    // Dev simulation prints the ticket once so a local status shell can be
+    // launched with `--token <this>`; production never logs the token value.
+    if std::env::var_os("STREAMGUARD_DEV").is_some() {
+        tracing::info!("dev status-shell ticket: {token}");
+    }
 
     // --- Interface discovery -> physical paths (spec 7/8) ----------------
     // Real platform adapters when available; the scanner falls back to an
@@ -137,17 +149,28 @@ async fn main() -> anyhow::Result<()> {
     let mut path_map = PathMap::new();
     let mut path_ids = Vec::with_capacity(chosen.len());
     let mut path_interfaces = Vec::with_capacity(chosen.len());
+    // Dev simulation talks to a 127.0.0.1 gateway; per-NIC bound sockets
+    // cannot route to loopback, so dev forces unbound paths (spec 8).
+    let dev_binding_free = std::env::var_os("STREAMGUARD_DEV").is_some();
     for iface in chosen {
         let path = path_map.id_for(iface);
         path_ids.push(path);
         // index 0 means "no reportable index" on that platform -> unbound.
-        path_interfaces.push((iface.ifindex != 0).then_some(iface.ifindex));
+        // Effective per-interface binding only when NOT in dev simulation.
+        path_interfaces.push(
+            if dev_binding_free {
+                None
+            } else {
+                (iface.ifindex != 0).then_some(iface.ifindex)
+            },
+        );
         tracing::info!(
             iface = %iface.name,
             ifindex = iface.ifindex,
             kind = ?iface.kind,
             path = path.get(),
-            "path bound to interface"
+            bound = !dev_binding_free,
+            "path ready"
         );
     }
 

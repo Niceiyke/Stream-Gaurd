@@ -51,7 +51,7 @@ Two terminals on one host (both read the same env values — the secret **must m
 | Gateway | `$env:STREAMGUARD_SECRET = 'dev-secret'; cargo run -p streamguard-gateway` (Writes `./sgcerts/cert.der` + `key.der` on first run.) |
 | Service | `$env:STREAMGUARD_SECRET = 'dev-secret'; $env:STREAMGUARD_ADDR = '127.0.0.1:12423'; cargo run -p streamguard-service` (Reads `./sgcerts/cert.der` as the TLS trust anchor; keep both working dirs in sync or set `STREAMGUARD_CERT_DIR` explicitly.) |
 
-Then the status shell: `cd desktop; cargo tauri dev -- --pipe \\.\pipe\streamguard-status --token <ticket>` (or `--addr 127.0.0.1:9100` on non-Windows). Optional knobs: `STREAMGUARD_PORT` (gateway, default 12423), `STREAMGUARD_SESSION` (service, hex session prefix), `STREAMGUARD_DEV=1` (both, in-memory TUN). Real adapters need `--features sg-tun/native-tun` on *both* binaries plus `WINTUN_DLL` pointing at `wintun.dll` on Windows — keep `native-tun` opt-in, never default-on in gates.
+Then the status shell: `cd desktop; cargo tauri dev -- --pipe \\.\pipe\streamguard-status --token <ticket>` (or `--addr 127.0.0.1:9100` on non-Windows). The service never logs the minted ticket outside dev; with `STREAMGUARD_DEV=1` it prints `dev status-shell ticket: <ticket>` — pass that value as `--token`. Optional knobs: `STREAMGUARD_PORT` (gateway, default 12423), `STREAMGUARD_SESSION` (service, hex session prefix), `STREAMGUARD_DEV=1` (both, in-memory TUN). Real adapters need `--features sg-tun/native-tun` on *both* binaries plus `WINTUN_DLL` pointing at `wintun.dll` on Windows — keep `native-tun` opt-in, never default-on in gates.
 
 ## Milestone status
 
