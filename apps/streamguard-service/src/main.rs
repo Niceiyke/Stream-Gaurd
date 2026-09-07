@@ -116,13 +116,15 @@ async fn main() -> anyhow::Result<()> {
     // Dev simulation prints the ticket once so a local status shell can be
     // launched with `--token <this>`; production never logs the token value.
     if std::env::var_os("STREAMGUARD_DEV").is_some() {
+        let prefix = streamguard_service::status::session_prefix(session);
         tracing::info!("dev status-shell ticket: {token}");
-        // Also drop it in TEMP so `run-dev.ps1 -Shell` can launch the shell
-        // with zero copying (dev-only; the ticket is short-lived and scoped
-        // to this simulated session).
+        // Also drop credential hints in TEMP so `run-dev.ps1 -Shell` can
+        // launch the shell with zero copying (dev-only; the ticket is
+        // short-lived and scoped to this simulated session).
+        let hint = format!("{token}\n{:08x}\n", prefix);
         let _ = std::fs::write(
             std::env::temp_dir().join("streamguard-dev-ticket.txt"),
-            token.as_bytes(),
+            hint.as_bytes(),
         );
     }
 

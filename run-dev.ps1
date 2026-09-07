@@ -28,17 +28,29 @@ Start-Process powershell -WorkingDirectory $root -ArgumentList '-NoExit', '-Comm
 
 # Terminal 3 - optional visual status shell (auto-reads the dev ticket that
 # the service drops in TEMP, so no -Token is needed when the service is up).
+# Config is passed via env vars (the app's documented fallback) instead of
+# CLI args, because CLI arg forwarding varies between the cargo and npm Tauri
+# wrappers; env vars are honored identically by both.
 if ($Shell) {
-    $ticket = if ([string]::IsNullOrWhiteSpace($Token)) {
-        $tf = Join-Path $env:TEMP 'streamguard-dev-ticket.txt'
-        if (Test-Path -LiteralPath $tf) { Get-Content -LiteralPath $tf -Raw }.Trim()
-    } else { $Token }
+    $tf = Join-Path $env:TEMP 'streamguard-dev-ticket.txt'
+    $ticket = ''; $prefix = ''
+    if ((Test-Path -LiteralPath $tf) -and -not [string]::IsNullOrWhiteSpace($Token)) {
+        $ticket = $Token
+    }
+    elseif (Test-Path -LiteralPath $tf) {
+        $parts = @((Get-Content -LiteralPath $tf -Raw) -split "`r?`n")
+        $ticket = $parts[0].Trim()
+        $prefix = $parts[1].Trim()
+    }
     if ([string]::IsNullOrWhiteSpace($ticket)) {
         "Shell requested but no dev ticket found - start the service first, then re-run with -Shell."
     }
     else {
+        if ([string]::IsNullOrWhiteSpace($prefix)) { $prefix = '0x00000000' }
         Start-Process powershell -WorkingDirectory (Join-Path $root 'desktop') -ArgumentList '-NoExit', '-Command',
-            "tauri dev -- --pipe \\.\pipe\streamguard-status --token `"$ticket`"" | Out-Null
+            "`$env:STREAMGUARD_STATUS_PIPE='\\.\pipe\streamguard-status'; " +
+            "`$env:STREAMGUARD_TOKEN='$ticket'; " +
+            "`$env:STREAMGUARD_SESSION_PREFIX='0x$prefix'; tauri dev" | Out-Null
         "Status shell window opened."
     }
 }
