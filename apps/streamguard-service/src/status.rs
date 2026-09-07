@@ -115,39 +115,71 @@ pub struct StatusSnapshot {
     pub warnings: Vec<String>,
 }
 
+/// Snapshot source for a `StatusProvider`.
+#[derive(Clone)]
+enum StatusSource {
+    /// Reads the live engine `Shared` state and `Counters` (production).
+    Live {
+        shared: Arc<Shared>,
+        counters: Arc<Mutex<Counters>>,
+    },
+    /// Answers fixed snapshots from a closure (external harnesses/tests).
+    Fixed(Arc<dyn Fn() -> StatusSnapshot + Send + Sync>),
+}
+
 /// Cloneable handle the IPC server uses to answer snapshot requests.
 ///
-/// Cheap to clone: it shares the same `Arc<Shared>` / `Arc<Mutex<Counters>>`
-/// the engine's loops run on, so one provider can be owned by the accept
-/// loop and cloned into every connection worker.
+/// Cheap to clone: the live source shares the same `Arc<Shared>` /
+/// `Arc<Mutex<Counters>>` the engine's loops run on, so one provider can be
+/// owned by the accept loop and cloned into every connection worker.
 #[derive(Clone)]
 pub struct StatusProvider {
-    shared: Arc<Shared>,
-    counters: Arc<Mutex<Counters>>,
+    source: StatusSource,
 }
 
 impl StatusProvider {
     pub(crate) fn new(shared: Arc<Shared>, counters: Arc<Mutex<Counters>>) -> Self {
-        Self { shared, counters }
+        Self {
+            source: StatusSource::Live { shared, counters },
+        }
+    }
+
+    /// Builds a provider that answers from a controllable closure instead of
+    /// live engine state — lets external harnesses (e.g. the Wordlyte SDK
+    /// integration tests) stand up `spawn_status_server` with a fixed
+    /// snapshot, including injected warnings or a degraded mode. The closure
+    /// must be infallible, cheap and bounded (spec 22.5 worker rules); this
+    /// constructor is for tests and sample consumers, never a replacement
+    /// for the engine's own `StatusProvider::new`.
+    pub fn from_snapshot_fn(f: impl Fn() -> StatusSnapshot + Send + Sync + 'static) -> Self {
+        Self {
+            source: StatusSource::Fixed(Arc::new(f)),
+        }
     }
 
     /// Materializes the current engine state. Bounded work: one `Session`
-    /// lock acquisition, one `metrics` clone and one counters clone.
+    /// lock acquisition, one `metrics` clone and one counters clone (or one
+    /// closure call for a fixed provider).
     pub async fn snapshot(&self) -> StatusSnapshot {
-        let (session_id, active, path_ids) = {
-            let s = self.shared.session.lock().await;
-            (
-                s.session_id(),
-                s.active_path(),
-                s.path_ids().collect::<Vec<_>>(),
-            )
-        };
-        let metrics = {
-            let m = self.shared.metrics.lock().await;
-            m.clone()
-        };
-        let counters = self.counters.lock().await.clone();
-        project_snapshot(session_id, active, path_ids, &metrics, &counters)
+        match &self.source {
+            StatusSource::Live { shared, counters } => {
+                let (session_id, active, path_ids) = {
+                    let s = shared.session.lock().await;
+                    (
+                        s.session_id(),
+                        s.active_path(),
+                        s.path_ids().collect::<Vec<_>>(),
+                    )
+                };
+                let metrics = {
+                    let m = shared.metrics.lock().await;
+                    m.clone()
+                };
+                let counters = counters.lock().await.clone();
+                project_snapshot(session_id, active, path_ids, &metrics, &counters)
+            }
+            StatusSource::Fixed(f) => f(),
+        }
     }
 }
 

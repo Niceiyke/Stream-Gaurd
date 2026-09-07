@@ -1,20 +1,18 @@
 //! Wordlyte-side status SDK integration tests (engineering step 16, spec
-//! §21 / §22.5). These bring up the *real* engine + gateway over loopback
-//! TCP so the SDK is exercised against the authentic authenticated status
-//! plane — the same transport Wordlyte Pro would consume.
+//! §21 / §22.5). They bring up the *real* authenticated status plane over
+//! loopback TCP so the SDK is exercised against the same transport Wordlyte
+//! Pro would consume.
 //!
-//! A note on the provider: the engine's `StatusProvider` has **no public
-//! constructor** (`StatusProvider::new` and `client::Shared` are
-//! `pub(crate)`), so an external crate cannot hand `spawn_status_server` a
-//! fake provider with a controlled snapshot. The only public route to a
-//! running server is `client::start(.., Some(endpoint))`, which constructs a
-//! real provider internally. That is itself a spec-21 blocker for a stable
-//! external-facing test harness (see REPORT), so these tests drive the real
-//! engine: the round-trip test asserts the SDK's projection is faithful
-//! against the live Bonding snapshot (2 bound paths), and the wrong-token
-//! test proves authentication is enforced end to end.
+//! Provider plumbing: the engine's `StatusProvider` has a public test seam,
+//! `StatusProvider::from_snapshot_fn`, so an external crate can hand
+//! `spawn_status_server` a provider that answers a FIXED snapshot (injected
+//! warnings, degraded mode) instead of live engine state. The seam test
+//! below drives that path; the other two run the real engine + gateway
+//! (`client::start(.., Some(endpoint))`), which constructs a live provider
+//! internally — the engine's Bonding snapshot (2 bound paths) and the
+//! wrong-token rejection both exercised end to end.
 //!
-//! Both tests use loopback TCP on `127.0.0.1`, so they need no admin and run
+//! All tests use loopback TCP on `127.0.0.1`, so they need no admin and run
 //! on any host. The usual sleep cadence lets the engine's async reader loops
 //! make progress (AGENTS.md Testing).
 
@@ -30,6 +28,11 @@ use sg_tun::{LoopbackTun, TunConfig};
 use sg_wordlyte::{WordlyteClient, WordlyteStatus};
 use streamguard_gateway::tunnel::{self, TunnelHandle};
 use streamguard_service::client;
+use streamguard_service::client::Counters;
+use streamguard_service::ipc::{spawn_status_server, StatusEndpoint};
+use streamguard_service::status::{
+    Mode, PathStatus, StatusCounters, StatusProvider, StatusSnapshot,
+};
 use tokio::time::{Duration, sleep};
 
 /// Reserves a concrete free loopback port by bind-and-release, so the
@@ -208,4 +211,68 @@ async fn wrong_token_fails_with_auth_error() {
 
     fx.client.stop().await;
     fx.host.abort();
+}
+
+/// The `StatusProvider::from_snapshot_fn` seam lets an external harness
+/// stand up `spawn_status_server` with a controlled snapshot — injected
+/// warnings, degraded mode — and round-trips it through the real
+/// authenticated loopback transport (spec §21).
+#[tokio::test]
+async fn controlled_snapshot_with_warnings_round_trips() {
+    let endpoint = loopback_tcp_endpoint();
+    let token = "wordlyte-seam-token";
+
+    let provider = StatusProvider::from_snapshot_fn(|| StatusSnapshot {
+        session_prefix: 0x0bad_c0de,
+        protecting: true,
+        mode: Mode::ActiveStandby,
+        paths: vec![PathStatus {
+            path_id: 1,
+            reachable: true,
+            rtt_ms: 18,
+            srtt_ms: 17,
+            jitter_ms: 3,
+            loss: 0.05,
+            available_kbps: 4200,
+            stability_secs: 240,
+        }],
+        aggregate_kbps: 4200,
+        active_path: Some(1),
+        counters: StatusCounters::default(),
+        warnings: vec!["cellular cap active".to_string()],
+    });
+    let server = spawn_status_server(
+        StatusEndpoint::Tcp(endpoint),
+        provider,
+        token,
+        Arc::new(tokio::sync::Mutex::new(Counters::default())),
+    )
+    .await
+    .expect("status server with a fixed provider binds and serves");
+
+    let addr = match server.endpoint() {
+        StatusEndpoint::Tcp(addr) => *addr,
+        #[cfg(windows)]
+        StatusEndpoint::NamedPipe(_) => panic!("fixture uses loopback TCP"),
+    };
+
+    let mut client = WordlyteClient::with_tcp(addr, token, 0x0bad_c0de).unwrap();
+    let ws = client
+        .status()
+        .await
+        .expect("the seam snapshot is reachable through the SDK");
+    assert!(ws.protection_enabled);
+    assert_eq!(ws.mode, "active_standby", "mode maps to the stable string");
+    assert!(ws.gateway_connected);
+    assert_eq!(ws.aggregate_available_kbps, 4200);
+    assert_eq!(ws.active_paths, vec![1]);
+    assert_eq!(ws.warnings, vec!["cellular cap active".to_string()]);
+    let pq = &ws.path_quality[0];
+    assert_eq!(
+        (pq.path_id, pq.rtt_ms, pq.loss_percent, pq.available_kbps),
+        (1, 18, 5, 4200),
+        "path quality sub-keys survive the real wire round-trip"
+    );
+
+    server.stop();
 }
