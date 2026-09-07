@@ -1,0 +1,213 @@
+:root {
+  --bg: #0f1420;
+  --card: #1a2130;
+  --card-border: #2a3448;
+  --text: #e6edf5;
+  --muted: #8b98ab;
+  --on: #2fbf71;
+  --off: #e5484d;
+  --accent: #4f8cff;
+  --warn: #ffb454;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px;
+  background: var(--card);
+  border-bottom: 1px solid var(--card-border);
+}
+
+.topbar h1 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.conn-state {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--card-border);
+}
+
+.conn-state[data-state="online"] {
+  color: var(--on);
+  border-color: var(--on);
+}
+
+.conn-state[data-state="offline"] {
+  color: var(--off);
+  border-color: var(--off);
+}
+
+.conn-state[data-state="unknown"] {
+  color: var(--muted);
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 16px;
+  padding: 20px;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  padding: 16px;
+}
+
+.card-wide {
+  grid-column: 1 / -1;
+}
+
+.card h2 {
+  margin: 0 0 12px;
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--muted);
+}
+
+.kv {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.kv-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.kv-row dt {
+  color: var(--muted);
+}
+
+.kv-row dd {
+  margin: 0;
+  font-weight: 600;
+}
+
+.badge {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.badge-on {
+  background: rgba(47, 191, 113, 0.15);
+  color: var(--on);
+}
+
+.badge-off {
+  background: rgba(229, 72, 77, 0.15);
+  color: var(--off);
+}
+
+.badge-muted {
+  background: rgba(139, 152, 171, 0.15);
+  color: var(--muted);
+}
+
+.badge-path {
+  background: rgba(79, 140, 255, 0.15);
+  color: var(--accent);
+}
+
+code {
+  font-family: "Cascadia Code", "Consolas", monospace;
+  background: rgba(255, 255, 255, 0.06);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.counters {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.counters li {
+  display: flex;
+  justify-content: space-between;
+  color: var(--muted);
+}
+
+.counters li span {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.paths {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.paths th,
+.paths td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--card-border);
+  font-variant-numeric: tabular-nums;
+}
+
+.paths th {
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.paths .empty,
+.warnings .empty {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.warnings {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.warnings li:not(.empty) {
+  color: var(--warn);
+  padding-left: 4px;
+}
+
+.error-bar {
+  padding: 8px 20px;
+  background: rgba(229, 72, 77, 0.12);
+  color: var(--off);
+  border-top: 1px solid var(--off);
+  font-size: 13px;
+}

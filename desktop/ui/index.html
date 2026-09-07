@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>StreamGuard</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>StreamGuard</h1>
+    <span id="conn-state" class="conn-state" data-state="unknown">connecting…</span>
+  </header>
+
+  <main class="layout">
+    <!-- Status card -->
+    <section class="card" id="status-card">
+      <h2>Status</h2>
+      <dl class="kv">
+        <div class="kv-row">
+          <dt>Protection</dt>
+          <dd><span id="protecting" class="badge badge-off">—</span></dd>
+        </div>
+        <div class="kv-row">
+          <dt>Mode</dt>
+          <dd><span id="mode" class="badge badge-muted">—</span></dd>
+        </div>
+        <div class="kv-row">
+          <dt>Aggregate bandwidth</dt>
+          <dd id="aggregate-kbps">—</dd>
+        </div>
+        <div class="kv-row">
+          <dt>Session prefix</dt>
+          <dd><code id="session-prefix">—</code></dd>
+        </div>
+        <div class="kv-row">
+          <dt>Active path</dt>
+          <dd id="active-path">—</dd>
+        </div>
+      </dl>
+    </section>
+
+    <!-- Counters -->
+    <section class="card" id="counters-card">
+      <h2>Counters</h2>
+      <ul class="counters">
+        <li>Frames to host <span id="c-frames-to-host">0</span></li>
+        <li>Datagrams to gateway <span id="c-datagrams-to-gateway">0</span></li>
+        <li>Duplicates dropped <span id="c-duplicates-dropped">0</span></li>
+        <li>Keepalives <span id="c-keepalives">0</span></li>
+        <li>Path selects <span id="c-path-selects">0</span></li>
+        <li>Path failures <span id="c-path-failures">0</span></li>
+        <li>Soft failures <span id="c-soft-failures">0</span></li>
+        <li>Probes sent <span id="c-probes-sent">0</span></li>
+        <li>Duplicates sent <span id="c-duplicates-sent">0</span></li>
+        <li>Weight sets <span id="c-weight-sets">0</span></li>
+        <li>Auth failures <span id="c-auth-failures">0</span></li>
+      </ul>
+    </section>
+
+    <!-- Paths table -->
+    <section class="card card-wide" id="paths-card">
+      <h2>Paths</h2>
+      <table class="paths">
+        <thead>
+          <tr>
+            <th>Path</th>
+            <th>Reachability</th>
+            <th>RTT (ms)</th>
+            <th>SRTT (ms)</th>
+            <th>Jitter (ms)</th>
+            <th>Loss %</th>
+            <th>kbps</th>
+            <th>Stability (s)</th>
+          </tr>
+        </thead>
+        <tbody id="paths-body">
+          <tr><td colspan="8" class="empty">no paths reported</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- Warnings -->
+    <section class="card card-wide" id="warnings-card">
+      <h2>Warnings</h2>
+      <ul id="warnings-list" class="warnings">
+        <li class="empty">none</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer class="error-bar" id="error-bar" hidden></footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

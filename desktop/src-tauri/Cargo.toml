@@ -1,0 +1,32 @@
+[package]
+name = "streamguard-desktop"
+version = "0.1.0"
+edition = "2021"
+# The desktop shell is a standalone (non-workspace) crate (spec 22 / step 12).
+# rust-version is the max of the engine's MSRV (the `streamguard-service` path
+# dep inherits 1.85 from the root workspace) and Tauri 2.x's own MSRV (1.77),
+# so 1.85 is the effective floor. Bumping the engine MSRV below is the only
+# way this must move.
+rust-version = "1.85"
+license = "MIT"
+description = "StreamGuard Tauri v2 desktop status shell (engineering step 12)"
+
+[build-dependencies]
+# tauri-build emits the assets/config glue `tauri::generate_context!` needs.
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri v2 runtime. `send-button` / `protocol-asset` / `specta` are not needed:
+# the only surface exposed is a single async `status_snapshot` command read by
+# plain JS via `window.__TAURI__.core.invoke` (withGlobalTauri).
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `streamguard-service::client` (the IPC planner) runs on a tokio multi-thread
+# runtime, which Tauri provides. The desktop crate declares the matching
+# feature set so feature unification holds for its async IPC calls.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+anyhow = "1"
+# Client half of the authenticated status plane (T1, commit 6b3cea7):
+# StatusClient / StatusSession / StatusEndpoint / fetch_snapshot.
+streamguard-service = { path = "../../apps/streamguard-service" }
