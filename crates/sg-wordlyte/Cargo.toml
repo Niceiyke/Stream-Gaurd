@@ -1,0 +1,30 @@
+[package]
+name = "sg-wordlyte"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Wordlyte Pro status API over the StreamGuard authenticated IPC plane (spec 21)"
+
+[dependencies]
+sg-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+streamguard-service = { path = "../../apps/streamguard-service" }
+tokio.workspace = true
+
+# Dev-dependencies mirror the engine's own `status_ipc` harness so the
+# integration tests can bring up a real server + client over loopback TCP on
+# any host. `StatusProvider` has no public constructor (it is `pub(crate)`),
+# so the only way an external consumer can obtain a running
+# `spawn_status_server` is by starting the engine itself is via
+# `client::start(.., Some(endpoint))` — see tests/wordlyte_integration.rs.
+[dev-dependencies]
+bytes.workspace = true
+rcgen.workspace = true
+sg-auth.workspace = true
+sg-core.workspace = true
+sg-session.workspace = true
+sg-transport = { workspace = true, features = ["quic"] }
+sg-tun.workspace = true
+streamguard-gateway = { path = "../../apps/streamguard-gateway" }

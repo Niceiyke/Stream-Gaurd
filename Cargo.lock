@@ -905,6 +905,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "sg-wordlyte"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "sg-auth",
+ "sg-core",
+ "sg-session",
+ "sg-transport",
+ "sg-tun",
+ "streamguard-gateway",
+ "streamguard-service",
+ "tokio",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

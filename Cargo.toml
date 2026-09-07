@@ -12,6 +12,7 @@ members = [
     "crates/sg-platform",
     "crates/sg-session",
     "crates/sg-auth",
+    "crates/sg-wordlyte",
     "apps/streamguard-service",
     "apps/streamguard-gateway",
 ]
@@ -56,6 +57,7 @@ sg-routing = { path = "crates/sg-routing" }
 sg-platform = { path = "crates/sg-platform" }
 sg-session = { path = "crates/sg-session" }
 sg-auth = { path = "crates/sg-auth" }
+sg-wordlyte = { path = "crates/sg-wordlyte" }
 
 [profile.release]
 lto = "thin"
