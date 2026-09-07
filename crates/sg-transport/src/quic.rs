@@ -126,8 +126,13 @@ pub async fn bootstrap_v1(
         sid: session_prefix(session_id),
         token: token.to_string(),
     };
-    path.send(envelope(PacketType::Control, session_id, init.encode()?))
-        .await?;
+    path.send(envelope(
+        path.path_id(),
+        PacketType::Control,
+        session_id,
+        init.encode()?,
+    ))
+    .await?;
 
     // Datagrams are unreliable; give the gateway a bounded window to reply.
     let reply = match tokio::time::timeout(
@@ -164,12 +169,17 @@ fn prefix_bytes(prefix: u32) -> [u8; 16] {
     b
 }
 
-fn envelope(packet_type: PacketType, session_id: SessionId, payload: Bytes) -> Envelope {
+fn envelope(
+    path_id: PathId,
+    packet_type: PacketType,
+    session_id: SessionId,
+    payload: Bytes,
+) -> Envelope {
     Envelope {
         version: sg_protocol::VERSION,
         packet_type,
         flags: 0,
-        path_id: PathId::new(0),
+        path_id,
         session_id,
         sequence: sg_core::Sequence::new(0),
         timestamp_ms: 0,

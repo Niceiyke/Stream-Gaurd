@@ -250,6 +250,10 @@ async fn reader_loop<T: Tun + Send + 'static>(
     // (Real deployments require the signed Init before any data flows.)
     let mut first_session: Option<SessionId> = None;
     let mut first_frame: Option<Envelope> = None;
+    // `binds` is the set of (session, path) pairs THIS connection bound; on
+    // connection loss they are evicted so the session falls back to a
+    // surviving path and the downlink never tries a dead path.
+    let mut binds: Vec<(SessionId, PathId)> = Vec::new();
     match transport.recv().await {
         Ok(first) if first.packet_type == PacketType::Control => {
             match ControlMsg::decode(&first.payload) {
@@ -262,6 +266,26 @@ async fn reader_loop<T: Tun + Send + 'static>(
                             tracing::warn!(error = %e, "gateway: failed to send ack");
                         }
                         counters.lock().await.paths += 1;
+                        // Bind the authenticated connection to its session right
+                        // away (spec 15 "associate multiple paths with a session").
+                        // The Init now carries the client's real path_id, so a
+                        // standby becomes visible gateway-side even before it ever
+                        // carries traffic — and a standby that dies silently is
+                        // still evicted on connection loss (spec 12 phase 1).
+                        let is_new_session = {
+                            let mut sessions = sessions.lock().await;
+                            let session = sessions.get_or_create(id);
+                            let is_new = session.path_count() == 0;
+                            if !session.has_path(first.path_id)
+                                && session.add_path(transport.clone(), first.path_id).is_ok()
+                            {
+                                binds.push((id, first.path_id));
+                            }
+                            is_new
+                        };
+                        if is_new_session {
+                            counters.lock().await.sessions += 1;
+                        }
                         first_session = Some(id);
                     }
                     Err(reason) => {
@@ -294,10 +318,6 @@ async fn reader_loop<T: Tun + Send + 'static>(
     // Remember authenticated init: require the path's OWN envelope session
     // to match what the ticket accredited (else the handshake was for a
     // different session).
-    // `binds` is the set of (session, path) pairs THIS connection bound; on
-    // connection loss they are evicted so the session falls back to a
-    // surviving path and the downlink never tries a dead path.
-    let mut binds: Vec<(SessionId, PathId)> = Vec::new();
     loop {
         let envelope = match first_frame.take() {
             Some(e) => e,

@@ -118,12 +118,15 @@ async fn valid_ticket_accredits_two_paths_for_one_session() {
     bootstrap_v1(&p2, session, &token).await.unwrap();
     sleep(Duration::from_millis(100)).await;
 
-    // Connections are accredited but no session exists until data arrives.
+    // Connections are accredited: both paths are bound to the session at
+    // authentication time (spec 15 "associate multiple paths with a
+    // session"), so a standby path is visible and evictable gateway-side
+    // even before it ever carries traffic (spec 12 phase 1).
     assert_eq!(handle.counters().await.paths, 2);
     assert_eq!(handle.counters().await.auth_rejections, 0);
-    assert_eq!(handle.counters().await.sessions, 0);
+    assert_eq!(handle.counters().await.sessions, 1);
 
-    // First data frame (on p1) forms the session and hits the host TUN.
+    // First data frame (on p1) hits the host TUN.
     let pkt = icmp_request([10, 0, 85, 2], [8, 8, 8, 8], 0x5555);
     p1.send(Envelope {
         version: VERSION,
@@ -140,7 +143,7 @@ async fn valid_ticket_accredits_two_paths_for_one_session() {
     sleep(Duration::from_millis(100)).await;
 
     let c = handle.counters().await;
-    assert_eq!(c.sessions, 1, "data frame creates the accredited session");
+    assert_eq!(c.sessions, 1, "both paths accredit the one wire session");
     assert_eq!(c.frames_to_host, 1);
     assert_eq!(handle.tun.lock().await.drain_outbound().len(), 1);
 
