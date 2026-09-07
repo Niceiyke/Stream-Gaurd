@@ -26,15 +26,20 @@ Start-Process powershell -WorkingDirectory $root -ArgumentList '-NoExit', '-Comm
 "Service window opened."
 "Note: the service prints 'dev status-shell ticket: <ticket>' - use it for the -Shell window."
 
-# Terminal 3 - optional visual status shell.
+# Terminal 3 - optional visual status shell (auto-reads the dev ticket that
+# the service drops in TEMP, so no -Token is needed when the service is up).
 if ($Shell) {
-    if ([string]::IsNullOrWhiteSpace($Token)) {
-        "Shell requested but no -Token given. Re-run with -Token <ticket> from the service window."
+    $ticket = if ([string]::IsNullOrWhiteSpace($Token)) {
+        $tf = Join-Path $env:TEMP 'streamguard-dev-ticket.txt'
+        if (Test-Path -LiteralPath $tf) { Get-Content -LiteralPath $tf -Raw }.Trim()
+    } else { $Token }
+    if ([string]::IsNullOrWhiteSpace($ticket)) {
+        "Shell requested but no dev ticket found - start the service first, then re-run with -Shell."
     }
     else {
         Start-Process powershell -WorkingDirectory (Join-Path $root 'desktop') -ArgumentList '-NoExit', '-Command',
-            "cargo tauri dev -- --pipe \\.\pipe\streamguard-status --token $Token" | Out-Null
-        "Status shell window opened (token: $Token)."
+            "cargo tauri dev -- --pipe \\.\pipe\streamguard-status --token `"$ticket`"" | Out-Null
+        "Status shell window opened."
     }
 }
 

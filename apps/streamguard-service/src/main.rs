@@ -117,6 +117,13 @@ async fn main() -> anyhow::Result<()> {
     // launched with `--token <this>`; production never logs the token value.
     if std::env::var_os("STREAMGUARD_DEV").is_some() {
         tracing::info!("dev status-shell ticket: {token}");
+        // Also drop it in TEMP so `run-dev.ps1 -Shell` can launch the shell
+        // with zero copying (dev-only; the ticket is short-lived and scoped
+        // to this simulated session).
+        let _ = std::fs::write(
+            std::env::temp_dir().join("streamguard-dev-ticket.txt"),
+            token.as_bytes(),
+        );
     }
 
     // --- Interface discovery -> physical paths (spec 7/8) ----------------
