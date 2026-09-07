@@ -373,7 +373,7 @@ async fn client_fails_over_when_the_active_path_dies() {
     assert!(client.sever_path(PathId::new(1)).await, "path 1 was bound");
 
     // The client must detect the loss, mark the path unreachable, promote
-    // path 2 AND steer the gateway; the gateway must evict the dead path so
+// path 2 AND steer the gateway; the gateway must evict the dead path so
     // its downlink falls back to path 2 instead of a dead connection.
     let mut converged = false;
     for _ in 0..50 {
@@ -389,7 +389,12 @@ async fn client_fails_over_when_the_active_path_dies() {
     assert!(
         converged,
         "client detected the loss (path_failures), promoted the standby (active=2), \
-         and the gateway evicted the dead path (paths_evicted)"
+         and the gateway evicted the dead path (paths_evicted); \
+         snapshot: client pf={} active={:?} gw evicted={} gw selects={}",
+        client.counters().await.path_failures,
+        client.active_path().await,
+        gw.counters().await.paths_evicted,
+        gw.counters().await.path_selects,
     );
     assert!(
         client.counters().await.path_selects >= 1,
@@ -406,7 +411,7 @@ async fn client_fails_over_when_the_active_path_dies() {
     sleep(Duration::from_millis(150)).await;
     assert_eq!(
         client.counters().await.datagrams_to_gateway, 2,
-        "request 2 leaves the client after failover"
+"request 2 leaves the client after failover"
     );
 
     let mut replied = false;
@@ -422,6 +427,147 @@ async fn client_fails_over_when_the_active_path_dies() {
     assert!(
         frames.contains(&Bytes::from(icmp_reply([10, 0, 85, 2], [1, 1, 1, 1], 0x2222))),
         "reply 2 goes to the client TUN"
+    );
+
+    client.stop().await;
+    gw.stop().await;
+    host_task.abort();
+}
+
+#[tokio::test]
+async fn client_bonds_two_healthy_paths_by_weight() {
+    let (cert_der, key_der) = {
+        let c = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        (c.cert.der().to_vec(), c.key_pair.serialize_der())
+    };
+    let server_cfg = server_tls(&cert_der, &key_der).unwrap();
+    let client_cfg = client_tls(&cert_der).unwrap();
+    let gateway = GatewayQuic::bind("127.0.0.1:0".parse().unwrap(), server_cfg).unwrap();
+    let addr = gateway.local_addr().unwrap();
+
+    let secret = b"bonding-test-secret".to_vec();
+    let host_tun = LoopbackTun::with_config(TunConfig {
+        name: "sg-wan0".into(),
+        address: "192.168.1.1".into(),
+        prefix_len: 24,
+        mtu: 1300,
+    });
+    let mut gw = tunnel::start(host_tun, gateway, secret.clone()).await;
+    let host_task = tokio::spawn(host_echo(gw.tun.clone()));
+
+    let client_tun = LoopbackTun::with_config(TunConfig {
+        name: "sg-lan0".into(),
+        address: "10.0.85.1".into(),
+        prefix_len: 24,
+        mtu: 1300,
+    });
+    let session = session_id_from_wire(0xb0b0b0b0);
+    let token = sg_auth::issue(&secret, session, 3600);
+    let mut client = client::start(
+        client_tun,
+        client::ClientOptions {
+            addr,
+            server_name: "localhost".into(),
+            client_config: client_cfg,
+            // Keepalives/probes parked so every counter below is attributable
+            // to the bonding batch; duplication disabled so the scheduler's
+            // distribution is the only uplink traffic (phase 3, spec 12).
+            keepalive_interval: Duration::from_secs(3600),
+            probe_interval: Duration::from_secs(3600),
+            probe_timeout: Duration::from_secs(3600),
+            probe_failure_threshold: 2,
+            redundancy_loss_threshold: 0.0,
+        },
+        session,
+        &[PathId::new(1), PathId::new(2)],
+        &token,
+    )
+    .await
+    .unwrap();
+    sleep(Duration::from_millis(150)).await;
+
+    // Both paths healthy but asymmetric: path 1 is fast/clean/high-capacity,
+    // path 2 is slower and lossier. Both stay under the 20% eligibility
+    // cliff, so the phase-3 scheduler bonds them with a lopsided weight
+    // ratio instead of failing path 2 over (spec 12 Phase 3).
+    let p1 = PathId::new(1);
+    let p2 = PathId::new(2);
+    client
+        .set_metrics(
+            p1,
+            PathMetrics {
+                reachable: true,
+                srtt_ms: 20,
+                loss: 0.01,
+                available_kbps: 50_000,
+                ..Default::default()
+            },
+        )
+        .await;
+    client
+        .set_metrics(
+            p2,
+            PathMetrics {
+                reachable: true,
+                srtt_ms: 90,
+                loss: 0.10,
+                available_kbps: 4_000,
+                ..Default::default()
+            },
+        )
+        .await;
+
+    // Inject a batch of host frames; each gets its own sequence from the
+    // shared per-session sequencer (seq 0..N regardless of path) and the
+    // scheduler spreads them across both eligible paths by weight.
+    let n: usize = 12;
+    for i in 0..n {
+        let id = 0x1001u16 + i as u16;
+        client
+            .tun
+            .lock()
+            .await
+            .enqueue(Bytes::from(icmp_request([10, 0, 85, 2], [8, 8, 8, 8], id)));
+    }
+
+    // The whole batch must round-trip: requests forwarded to the host TUN in
+    // order (gateway reorder window holds the interleaved arrivals, spec
+    // 11.2), replies routed back on the active path.
+    let mut delivered = false;
+    for _ in 0..100 {
+        if client.counters().await.frames_to_host as usize == n {
+            delivered = true;
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(delivered, "all {n} replies delivered to the client TUN");
+
+    let cc = client.counters().await;
+    assert_eq!(cc.datagrams_to_gateway as usize, n, "no duplicates, no lost frames");
+    let d1 = *cc.uplink.get(&p1).unwrap_or(&0);
+    let d2 = *cc.uplink.get(&p2).unwrap_or(&0);
+    assert_eq!(d1 + d2, n as u64, "every frame is accounted for on a path");
+    assert!(d1 > 0 && d2 > 0, "bonding spread the batch across BOTH paths (p1={d1}, p2={d2})");
+    assert!(d1 > d2, "the faster path carries the larger share (p1={d1}, p2={d2})");
+    let ratio12 = d1 as f32 / d2 as f32;
+    assert!(
+        (1.2..=3.5).contains(&ratio12),
+        "share ratio {ratio12} is proportional to the ~2.4:1 weight ratio (p1={d1}, p2={d2})"
+    );
+
+    // Reorder contract: the interleaved arrival is reassembled with no drops.
+    assert_eq!(cc.duplicates_dropped, 0, "client reorder window saw no drop");
+    std::thread::sleep(Duration::from_millis(100));
+    let gwc = gw.counters().await;
+    assert_eq!(gwc.frames_to_host as usize, n, "gateway forwarded every frame in order");
+    assert_eq!(gwc.duplicates_dropped, 0, "gateway reorder window saw no drop");
+
+    let frames = client.tun.lock().await.drain_outbound();
+    assert_eq!(
+        frames.len(),
+        n,
+        "all {n} echoed replies are in the client TUN"
     );
 
     client.stop().await;

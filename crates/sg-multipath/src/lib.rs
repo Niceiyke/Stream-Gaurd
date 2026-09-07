@@ -5,11 +5,11 @@
 //! weighted bonding. The scheduler is the primary differentiating
 //! component and owns authoritative path state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use bytes::Bytes;
-use sg_core::{error::Result, Sequence};
-use sg_health::PathMetrics;
+use sg_core::{error::Result, PathId, Sequence};
+use sg_health::{DefaultScorer, PathMetrics, Scorer};
 
 /// Which scheduler phase is active (spec section 12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +29,8 @@ pub enum Decision {
     Send { path: u8 },
     /// Send in parallel on the active + redundancy path(s).
     Duplicate { paths: [u8; 2] },
+    /// No eligible path right now; the uplink loop should skip this packet.
+    Skip,
 }
 
 /// Feeds scheduler decisions; the engine submits metric updates as
@@ -38,10 +40,186 @@ pub trait Scheduler: Send + Sync {
     fn update_metrics(&mut self, metrics: &PathMetrics, path: u8) -> Result<()>;
 
     /// Chooses how to exit the next queued packet.
-    fn decide(&self) -> Decision;
+    fn decide(&mut self) -> Decision;
 
     /// Current phase.
     fn phase(&self) -> SchedulerPhase;
+}
+
+/// Phase 3 weighted-bonding scheduler (spec 12 Phase 3).
+///
+/// Distributes packets across eligible paths in proportion to a per-path
+/// weight derived from the health metrics (bandwidth, loss, srtt, jitter —
+/// spec 13). Weights are normalized to sum to ~1 over the eligible set and
+/// recomputed on every metric update, so the distribution tracks the paths
+/// continuously (spec 12 phase 3 "adjust weights continuously"). Paths that
+/// are unreachable or whose loss crossed the 20% eligibility cliff
+/// (`PathMetrics::is_eligible`) receive zero weight.
+///
+/// Selection uses a smooth weighted round robin (no randomness): every
+/// packet advances each eligible path's accumulator by its normalized
+/// weight and picks the largest, subtracting the total weight from the
+/// winner. Over a batch the interleave converges to the weight ratio, and a
+/// single eligible path is chosen 100% of the time (today's active/standby
+/// is the limit case). No hysteresis is needed: weights move continuously
+/// with the metrics (spec 14 is about the *active* pick; bonding spreads
+/// by definition).
+#[derive(Debug, Default)]
+pub struct WeightedBondingScheduler {
+    /// Last-fed metric snapshot, keyed by path id.
+    metrics: HashMap<u8, PathMetrics>,
+    /// Normalized weights; sum ~1 over the eligible paths, 0 for others.
+    weights: HashMap<u8, f32>,
+    /// Smooth-WRR accumulators (persist across `decide` calls so the
+    /// interleave stays proportional over time).
+    current: HashMap<u8, f32>,
+    /// Sum of all normalized weights (=1 while any path is eligible).
+    total_weight: f32,
+}
+
+impl WeightedBondingScheduler {
+    /// Refreshes the metric snapshot from `paths`, using `metrics` where a
+    /// path is metered and an eligible-by-default snapshot elsewhere
+    /// (unmetered paths are assumed usable until the health engine says
+    /// otherwise — matches `choose_path` in the service engine). Recomputes
+    /// the normalized weights.
+    pub fn update_from(
+        &mut self,
+        paths: impl Iterator<Item = PathId>,
+        metrics: &HashMap<PathId, PathMetrics>,
+    ) {
+        self.metrics.clear();
+        for p in paths {
+            let m = match metrics.get(&p) {
+                Some(m) => m.clone(),
+                None => PathMetrics {
+                    reachable: true,
+                    ..Default::default()
+                },
+            };
+            self.metrics.insert(p.get(), m);
+        }
+        self.recompute();
+    }
+
+    /// The current normalized per-path weights (sum ~1 over eligible paths).
+    /// Empty when no path is eligible.
+    pub fn normalized_weights(&self) -> Vec<(u8, f32)> {
+        let mut w: Vec<(u8, f32)> = self
+            .weights
+            .iter()
+            .map(|(p, w)| (*p, *w))
+            .filter(|(_, w)| *w > 0.0)
+            .collect();
+        w.sort_by_key(|(p, _)| *p);
+        w
+    }
+
+    /// The preferred (highest-weight) eligible path — the active/downlink
+    /// preference. Ties keep the currently active path, falling back to the
+    /// lowest path id, so a tie never triggers a spurious `PathSelect`.
+    /// Iteration is by ascending path id so equal-weight ties are
+    /// deterministic (HashMap order is randomized).
+    pub fn preferred_path(&self, current: Option<PathId>) -> Option<PathId> {
+        let mut ordered: Vec<(u8, f32)> = self
+            .weights
+            .iter()
+            .map(|(p, w)| (*p, *w))
+            .collect();
+        ordered.sort_by_key(|(p, _)| *p);
+        let mut best: Option<(u8, f32)> = None;
+        for (p, w) in ordered {
+            if w <= 0.0 {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some((_, bw)) if w > bw => true,
+                Some((bp, bw)) => {
+                    w == bw
+                        && current.is_some_and(|c| c.get() == p)
+                        && current.is_some_and(|c| c.get() != bp)
+                }
+            };
+            if better {
+                best = Some((p, w));
+            }
+        }
+        best.map(|(p, _)| PathId::new(p))
+    }
+
+    /// Smooth weighted round robin over the eligible paths (spec 12 Phase 3
+    /// "distribute packets according to path capacity/quality"). Candidates
+    /// are visited by ascending path id so first-packet ties are
+    /// deterministic (HashMap order is randomized).
+    pub fn decide(&mut self) -> Decision {
+        let mut eligible: Vec<u8> = self
+            .weights
+            .iter()
+            .filter(|(_, w)| **w > 0.0)
+            .map(|(p, _)| *p)
+            .collect();
+        eligible.sort_unstable();
+        if eligible.is_empty() {
+            return Decision::Skip;
+        }
+        let mut best: Option<(u8, f32)> = None;
+        for p in eligible {
+            let acc = self.current.entry(p).or_insert(0.0);
+            *acc += self.weights[&p];
+            if best.is_none_or(|(_, bv)| *acc > bv) {
+                best = Some((p, *acc));
+            }
+        }
+        match best {
+            Some((pid, _)) => {
+                if let Some(acc) = self.current.get_mut(&pid) {
+                    *acc -= self.total_weight;
+                }
+                Decision::Send { path: pid }
+            }
+            None => Decision::Skip,
+        }
+    }
+
+    /// Recomputes the normalized weights from the stored metric snapshot.
+    /// Raw weight mirrors `DefaultScorer` (spec 7 weights: bandwidth 40%,
+    /// loss 30%, latency 20%, jitter 10%) so bonding and health scoring
+    /// agree; ineligible paths are clamped to zero.
+    fn recompute(&mut self) {
+        let mut raw: HashMap<u8, f32> = HashMap::new();
+        let mut total = 0.0f32;
+        for (p, m) in &self.metrics {
+            let w = if m.is_eligible() { DefaultScorer::default().score(m) } else { 0.0 };
+            raw.insert(*p, w);
+            total += w;
+        }
+        self.weights.clear();
+        self.total_weight = 0.0;
+        if total > 0.0 {
+            for (p, w) in raw {
+                let n = w / total;
+                self.weights.insert(p, n);
+                self.total_weight += n;
+            }
+        }
+    }
+}
+
+impl Scheduler for WeightedBondingScheduler {
+    fn update_metrics(&mut self, metrics: &PathMetrics, path: u8) -> Result<()> {
+        self.metrics.insert(path, metrics.clone());
+        self.recompute();
+        Ok(())
+    }
+
+    fn decide(&mut self) -> Decision {
+        WeightedBondingScheduler::decide(self)
+    }
+
+    fn phase(&self) -> SchedulerPhase {
+        SchedulerPhase::WeightedBonding
+    }
 }
 
 /// Monotonic packet sequencer (spec 11.2). One instance per session.
@@ -277,5 +455,189 @@ mod tests {
         let o = b.deliver(Sequence::new(5), Bytes::from_static(b"five"));
         assert!(o.dropped, "seq5 exceeds the window; never evicts 1..4");
         assert_eq!(b.pending(), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3 weighted bonding (spec 12 Phase 3)
+    // -----------------------------------------------------------------------
+
+    fn eligible(srtt_ms: u32, loss: f32, available_kbps: u32) -> PathMetrics {
+        PathMetrics {
+            reachable: true,
+            srtt_ms,
+            loss,
+            available_kbps,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn bonding_weights_sum_to_one_over_eligible_paths() {
+        let mut sched = WeightedBondingScheduler::default();
+        let mut metrics = HashMap::new();
+        metrics.insert(PathId::new(1), eligible(20, 0.01, 50_000));
+        metrics.insert(PathId::new(2), eligible(100, 0.05, 10_000));
+        metrics.insert(PathId::new(3), eligible(200, 0.12, 2_000));
+        sched.update_from([PathId::new(1), PathId::new(2), PathId::new(3)].into_iter(), &metrics);
+
+        let w = sched.normalized_weights();
+        assert_eq!(w.len(), 3, "all three eligible paths carry weight");
+        let sum: f32 = w.iter().map(|(_, w)| w).sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-4,
+            "normalized weights sum to ~1, got {sum}"
+        );
+        // Weights are monotone with health: path 1 (fast, clean) > path 2 > path 3.
+        assert!(w[0].1 > w[1].1 && w[1].1 > w[2].1, "health orders the weights");
+    }
+
+    #[test]
+    fn bonding_penalizes_srtt_loss_and_jitter() {
+        let fast = eligible(20, 0.01, 50_000);
+        let slow = eligible(180, 0.01, 50_000);
+        let lossy = eligible(20, 0.15, 50_000);
+        let jittery = PathMetrics {
+            jitter_ms: 40,
+            ..eligible(20, 0.01, 50_000)
+        };
+
+        let s = DefaultScorer::default();
+        assert!(s.score(&fast) > s.score(&slow), "high srtt is penalized");
+        assert!(s.score(&fast) > s.score(&lossy), "high loss is penalized");
+        assert!(s.score(&fast) > s.score(&jittery), "high jitter is penalized");
+    }
+
+    #[test]
+    fn bonding_excludes_ineligible_paths_from_the_mix() {
+        let mut sched = WeightedBondingScheduler::default();
+        let mut metrics = HashMap::new();
+        metrics.insert(PathId::new(1), eligible(20, 0.01, 50_000));
+        // Path 2: reachable but loss crossed the 20% cliff — ineligible.
+        metrics.insert(PathId::new(2), eligible(20, 0.25, 50_000));
+        // Path 3: hard-unreachable.
+        metrics.insert(PathId::new(3), PathMetrics {
+            reachable: false,
+            ..Default::default()
+        });
+        sched.update_from(
+            [PathId::new(1), PathId::new(2), PathId::new(3)].into_iter(),
+            &metrics,
+        );
+
+        let w = sched.normalized_weights();
+        assert_eq!(w.len(), 1, "only the one eligible path keeps weight");
+        assert!((w[0].1 - 1.0).abs() < 1e-4, "single eligible path gets all weight");
+        assert_eq!(
+            sched.decide(),
+            Decision::Send { path: 1 },
+            "the lone eligible path carries every packet"
+        );
+    }
+
+    #[test]
+    fn bonding_weights_move_continuously_when_metrics_update() {
+        let mut sched = WeightedBondingScheduler::default();
+        let mut metrics = HashMap::new();
+        metrics.insert(PathId::new(1), eligible(20, 0.01, 50_000));
+        metrics.insert(PathId::new(2), eligible(20, 0.01, 50_000));
+        sched.update_from([PathId::new(1), PathId::new(2)].into_iter(), &metrics);
+        let w0 = sched.normalized_weights();
+        assert!((w0[0].1 - 0.5).abs() < 1e-4, "equal metrics -> equal weights");
+
+        // Path 2 keeps degrading one step at a time; its share must shrink
+        // monotonically (spec 12 phase 3 "adjust weights continuously" — no
+        // hysteresis step in the weights themselves).
+        let mut prev = w0[1].1;
+        for (srtt_ms, loss) in [(60, 0.02), (120, 0.05), (180, 0.12)] {
+            sched.update_metrics(&eligible(srtt_ms, loss, 50_000), 2).unwrap();
+            let w = sched.normalized_weights();
+            let w2 = w.iter().find(|(p, _)| *p == 2).map(|(_, w)| *w).unwrap();
+            assert!(w2 < prev, "path 2 share keeps shrinking: {prev} -> {w2}");
+            prev = w2;
+        }
+    }
+
+    #[test]
+    fn bonding_distributes_proportional_to_weight() {
+        let mut sched = WeightedBondingScheduler::default();
+        let mut metrics = HashMap::new();
+        // Healthy fast path vs. a slower path; raw scores are ~0.968 and
+        // ~0.27, so the normalized ratio is roughly 4:1 and definitely > 2:1.
+        metrics.insert(PathId::new(1), eligible(20, 0.01, 50_000));
+        metrics.insert(PathId::new(2), eligible(160, 0.12, 5_000));
+        sched.update_from([PathId::new(1), PathId::new(2)].into_iter(), &metrics);
+
+        let w = sched.normalized_weights();
+        assert_eq!(w.len(), 2);
+        let strong = w.iter().find(|(p, _)| *p == 1).unwrap().1;
+        let weak = w.iter().find(|(p, _)| *p == 2).unwrap().1;
+        assert!(strong > weak, "healthy path dominates the weight");
+
+        let mut hits = [0u64; 2];
+        for _ in 0..60 {
+            match sched.decide() {
+                Decision::Send { path: 1 } => hits[0] += 1,
+                Decision::Send { path: 2 } => hits[1] += 1,
+                other => panic!("unexpected bonding decision {other:?}"),
+            }
+        }
+        assert!(hits[0] > 0 && hits[1] > 0, "both paths receive traffic");
+        let ratio = hits[0] as f32 / hits[1] as f32;
+        let wanted = strong / weak;
+        assert!(
+            (ratio - wanted).abs() <= 0.5,
+            "empirical ratio {ratio} tracks the weight ratio {wanted}"
+        );
+    }
+
+    #[test]
+    fn bonding_single_path_fallback_uses_it_always() {
+        let mut sched = WeightedBondingScheduler::default();
+        let mut metrics = HashMap::new();
+        metrics.insert(PathId::new(1), eligible(20, 0.01, 50_000));
+        sched.update_from([PathId::new(1)].into_iter(), &metrics);
+
+        for _ in 0..20 {
+            assert_eq!(
+                sched.decide(),
+                Decision::Send { path: 1 },
+                "only one eligible path: 100% of packets on it"
+            );
+        }
+        assert_eq!(sched.preferred_path(None), Some(PathId::new(1)));
+    }
+
+    #[test]
+    fn bonding_prefers_the_current_active_path_on_ties() {
+        let mut sched = WeightedBondingScheduler::default();
+        let mut metrics = HashMap::new();
+        metrics.insert(PathId::new(1), eligible(20, 0.01, 50_000));
+        metrics.insert(PathId::new(2), eligible(20, 0.01, 50_000));
+        sched.update_from([PathId::new(1), PathId::new(2)].into_iter(), &metrics);
+
+        assert_eq!(
+            sched.preferred_path(Some(PathId::new(2))),
+            Some(PathId::new(2)),
+            "an equal-weight tie keeps the current active path (no re-announce)"
+        );
+        assert_eq!(
+            sched.preferred_path(None),
+            Some(PathId::new(1)),
+            "no current active path: lowest id wins the tie"
+        );
+    }
+
+    #[test]
+    fn bonding_skips_when_no_path_is_eligible() {
+        let mut sched = WeightedBondingScheduler::default();
+        let mut metrics = HashMap::new();
+        metrics.insert(PathId::new(1), PathMetrics {
+            reachable: false,
+            ..Default::default()
+        });
+        sched.update_from([PathId::new(1)].into_iter(), &metrics);
+        assert!(sched.normalized_weights().is_empty());
+        assert_eq!(sched.decide(), Decision::Skip);
+        assert_eq!(sched.preferred_path(None), None);
     }
 }

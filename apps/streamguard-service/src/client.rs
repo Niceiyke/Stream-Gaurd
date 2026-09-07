@@ -6,14 +6,17 @@
 //! - one QUIC `PathTransport` per physical path, bound to that session,
 //! - a **downlink reader** per path: `recv()` an envelope, dedup via the
 //!   per-session reorder window, write the host IP packet into the TUN,
-//! - an **uplink task**: read a local packet from the TUN, sequence it,
-//!   pick the healthiest eligible path (phase 1 active/standby driven by
-//!   `DefaultScorer`) and send it,
+//! - an **uplink task**: read a local packet from the TUN, sequence it via
+//!   the shared per-session sequencer and pick the send path from the
+//!   phase-3 `WeightedBondingScheduler` (spec 12 Phase 3: distribute by
+//!   capacity/quality). The scheduler's preferred (highest-weight) path
+//!   stays the active/downlink path; with one eligible path the whole thing
+//!   degenerates to the phase-1 active/standby behaviour,
 //! - a **keepalive task per path**: emit `Keepalive` envelopes on every
 //!   bound path (spec 12 phase 1 "keep alternate path alive") so standby
 //!   QUIC connections stay warm and their NAT mappings stay fresh for
 //!   failover (spec 17 stable egress),
-//! - **rev1 path control**: when the health-driven pick changes, the uplink
+//! - **rev1 path control**: when the preferred path changes, the uplink
 //!   task sends a `Control::PathSelect` so the gateway moves that session's
 //!   downlink to the newly active path,
 //! - **failover**: a transport-level failure (reader `recv` error or a failed
@@ -33,6 +36,7 @@ use bytes::Bytes;
 use sg_core::error::Error;
 use sg_core::{PathId, SessionId};
 use sg_health::{DefaultScorer, PathMetrics, Scorer};
+use sg_multipath::{Decision, WeightedBondingScheduler};
 use sg_protocol::control::ControlMsg;
 use sg_protocol::{Envelope, PacketType, VERSION};
 use sg_session::Session;
@@ -58,6 +62,10 @@ struct Shared {
     /// Loss threshold above which the uplink duplicates a packet onto a
     /// redundant path (phase 2 adaptive redundancy, spec 12).
     redundancy_loss_threshold: f32,
+    /// Phase-3 weighted-bonding scheduler (spec 12 Phase 3): feeds on the
+    /// shared health snapshot in the uplink loop and decides the per-packet
+    /// path by normalized weight.
+    scheduler: Mutex<WeightedBondingScheduler>,
 }
 
 /// Aggregate counters exposed to tests after the engine runs.
@@ -85,6 +93,10 @@ pub struct Counters {
     /// Uplink `Duplicate` copies sent when the selected path was degraded
     /// (phase 2 adaptive redundancy, spec 12).
     pub duplicates_sent: u64,
+    /// Per-path counts of the primary `Data` envelope sent (phase 3 weighted
+    /// bonding distribution, spec 12 Phase 3). Duplicates are not counted
+    /// here — this is the scheduler's send distribution, not the wire total.
+    pub uplink: std::collections::HashMap<PathId, u64>,
 }
 
 /// A running client engine. Call `stop` to tear it down.
@@ -222,6 +234,7 @@ pub async fn start<T: Tun + Send + 'static>(
         pending_probes: Mutex::new(HashMap::new()),
         probe_misses: Mutex::new(HashMap::new()),
         redundancy_loss_threshold: options.redundancy_loss_threshold,
+        scheduler: Mutex::new(WeightedBondingScheduler::default()),
     });
 
     // Spawn one downlink reader per bound path, one keepalive task if a
@@ -644,30 +657,55 @@ async fn uplink_loop<T: Tun + Send + 'static>(
             }
         };
 
-        // Sequence + pick the healthiest eligible path, then send. If the
-        // selected path is degraded (loss >= redundancy threshold, phase 2
-        // adaptive redundancy, spec 12), a `Duplicate` copy of the same
-        // sequence also goes out on a second healthy path; the gateway reorder
-        // window keeps the first copy to arrive (first-valid-wins).
-        let (seq, path_id, session_id) = {
+        // Sequence via the shared per-session sequencer, then let the
+        // phase-3 weighted-bonding scheduler pick the per-packet path
+        // (spec 12 Phase 3). Keeping ONE sequencer per session guarantees
+        // gateway-side in-order reassembly regardless of which path wins a
+        // given packet — that is how bonding prevents slow paths from
+        // causing excessive reordering (spec 11.3 / 12 Phase 3).
+        let (seq, session_id, path_ids, current_active) = {
             let mut sess = shared.session.lock().await;
-            let seq = sess.next_sequence();
-            let best = {
-                let metrics = shared.metrics.lock().await;
-                let current = sess.active_path();
-                choose_path(&metrics, sess.path_ids().collect::<Vec<_>>().as_slice(), current)
-            };
-            let best = match best {
-                Some(p) => p,
-                None => continue,
-            };
-            let _ = sess.set_active_path(best);
-            (seq, best, sess.session_id())
+            (
+                sess.next_sequence(),
+                sess.session_id(),
+                sess.path_ids().collect::<Vec<_>>(),
+                sess.active_path(),
+            )
         };
 
-        // Rev1 path control: tell the gateway when the active path changes so
-        // its downlink follows the failover (fire-and-forget datagram).
-        announce_path(&shared, &counters, path_id, session_id).await;
+        // Weighted bonding: feed the latest health snapshot in, then take
+        // the per-packet send path from the normalized weight distribution
+        // and the preferred (highest-weight) path as the active/downlink
+        // preference. With a single eligible path this degrades to today's
+        // active/standby behaviour exactly: that path wins 100% of packets
+        // and is the only preference (no regression to phase-1 failover).
+        let (send_path, preferred) = {
+            let metrics = shared.metrics.lock().await;
+            let mut sched = shared.scheduler.lock().await;
+            sched.update_from(path_ids.iter().copied(), &metrics);
+            let send = match sched.decide() {
+                Decision::Send { path } => Some(PathId::new(path)),
+                Decision::Duplicate { .. } => {
+                    unreachable!("bonding schedules one path per packet")
+                }
+                Decision::Skip => None,
+            };
+            (send, sched.preferred_path(current_active))
+        };
+        let Some(path_id) = send_path else {
+            // Scheduler reports no eligible path this cycle; drop the packet.
+            continue;
+        };
+        if let Some(preferred) = preferred {
+            {
+                let mut sess = shared.session.lock().await;
+                let _ = sess.set_active_path(preferred);
+            }
+            // Rev1 path control: tell the gateway when the active path
+            // changes (fire-and-forget datagram). The gateway steers its
+            // downlink replies from this; bonding only spreads the uplink.
+            announce_path(&shared, &counters, preferred, session_id).await;
+        }
 
         let env = Envelope {
             version: VERSION,
@@ -685,7 +723,11 @@ async fn uplink_loop<T: Tun + Send + 'static>(
             .await
             .send_on(path_id, env)
             .await;
-        counters.lock().await.datagrams_to_gateway += 1;
+        {
+            let mut c = counters.lock().await;
+            c.datagrams_to_gateway += 1;
+            *c.uplink.entry(path_id).or_insert(0) += 1;
+        }
 
         // Redundant copy: pick the best *other* healthy path and mirror the
         // same sequence as a `Duplicate` so a lossy active path does not cost
