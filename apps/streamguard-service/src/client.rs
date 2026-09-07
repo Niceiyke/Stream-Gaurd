@@ -47,30 +47,30 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 
 /// Shared bundle of state every task needs.
-struct Shared {
-    session: Mutex<Session>,
-    metrics: Mutex<HashMap<PathId, PathMetrics>>,
+pub(crate) struct Shared {
+    pub(crate) session: Mutex<Session>,
+    pub(crate) metrics: Mutex<HashMap<PathId, PathMetrics>>,
     /// The last active path the gateway was told about (downlink target).
     /// `None` before the first uplink decision.
-    notified: Mutex<Option<PathId>>,
+    pub(crate) notified: Mutex<Option<PathId>>,
     /// Outstanding health probes: (path, probe id) -> sent time; resolved by
     /// the downlink reader when the gateway's `PathStatus` reply arrives.
-    pending_probes: Mutex<HashMap<(PathId, u32), std::time::Instant>>,
+    pub(crate) pending_probes: Mutex<HashMap<(PathId, u32), std::time::Instant>>,
     /// Consecutive probes lost on each path; crossing the failure threshold
     /// marks the path unreachable — soft failure (spec 12 / 13 / 31.3).
-    probe_misses: Mutex<HashMap<PathId, u32>>,
+    pub(crate) probe_misses: Mutex<HashMap<PathId, u32>>,
     /// Loss threshold above which the uplink duplicates a packet onto a
     /// redundant path (phase 2 adaptive redundancy, spec 12).
-    redundancy_loss_threshold: f32,
+    pub(crate) redundancy_loss_threshold: f32,
     /// Phase-3 weighted-bonding scheduler (spec 12 Phase 3): feeds on the
     /// shared health snapshot in the uplink loop and decides the per-packet
     /// path by normalized weight.
-    scheduler: Mutex<WeightedBondingScheduler>,
+    pub(crate) scheduler: Mutex<WeightedBondingScheduler>,
     /// The weight distribution last published to the gateway via
     /// `Control::WeightSet` (phase-3 downlink mirror). `None` before the
     /// first advertisement; the material-change gate mirrors `notified` for
     /// `PathSelect` so the steady state does not spam the control channel.
-    notified_weights: Mutex<Option<Vec<(u8, f32)>>>,
+    pub(crate) notified_weights: Mutex<Option<Vec<(u8, f32)>>>,
 }
 
 /// Aggregate counters exposed to tests after the engine runs.
@@ -93,7 +93,11 @@ pub struct Counters {
     /// Paths marked unreachable by the soft-liveness monitor (no inbound
     /// envelope within `probe_timeout`), then failed over.
     pub soft_failures: u64,
-/// Per-path health probes sent (each awaits a `PathStatus` reply).
+    /// Status IPC connections rejected by the challenge-response handshake
+    /// (spec 22.5 / engineering step 12): wrong MAC, stale/replayed nonce or
+    /// malformed auth frame. Mirrors `auth_rejections` at the gateway.
+    pub status_auth_failures: u64,
+    /// Per-path health probes sent (each awaits a `PathStatus` reply).
     pub probes_sent: u64,
     /// Uplink `Duplicate` copies sent when the selected path was degraded
     /// (phase 2 adaptive redundancy, spec 12).
@@ -200,12 +204,18 @@ pub struct ClientOptions {
 /// v1 bootstrap handshake (`token` = gateway-signed session ticket), binds
 /// the accredited paths to the session, then starts the uplink + downlink
 /// loops and one keepalive task per path.
+///
+/// When `status` is `Some`, spawns the authenticated status IPC server (spec
+/// 22.5 / engineering step 12) on that endpoint — a named pipe on Windows or
+/// a loopback TCP listener — keyed by the same `token`. The server is torn
+/// down with the engine on `ClientHandle::stop`.
 pub async fn start<T: Tun + Send + 'static>(
     tun: T,
     options: ClientOptions,
     session_id: SessionId,
     paths: &[PathId],
     token: &str,
+    status: Option<crate::ipc::StatusEndpoint>,
 ) -> anyhow::Result<ClientHandle<T>> {
     let tun: Arc<Mutex<T>> = Arc::new(Mutex::new(tun));
     let counters = Arc::new(Mutex::new(Counters::default()));
@@ -284,6 +294,23 @@ pub async fn start<T: Tun + Send + 'static>(
     }
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    // Optional authenticated status plane (engineering step 12): the IPC
+    // server answers `StatusSnapshot` requests from the UI. Spawned before
+    // the run loop so its accept loop is already pending when the run loop
+    // starts; aborted with the engine on shutdown.
+    let status_task = match status {
+        Some(endpoint) => {
+            let provider =
+                crate::status::StatusProvider::new(shared.clone(), counters.clone());
+            let handle =
+                crate::ipc::spawn_status_server(endpoint, provider, token, counters.clone())
+                    .await?;
+            Some(handle.task)
+        }
+        None => None,
+    };
+
     let run = tokio::spawn(run_loop(
         tun.clone(),
         shared.clone(),
@@ -292,6 +319,7 @@ pub async fn start<T: Tun + Send + 'static>(
         reader_handles,
         keepalive_handles,
         probe_handles,
+        status_task,
     ));
 
     Ok(ClientHandle {
@@ -303,6 +331,9 @@ pub async fn start<T: Tun + Send + 'static>(
     })
 }
 
+// Task-owned handle vectors are deliberately passed one by one: grouping
+// them into a struct buys nothing at a single call site.
+#[allow(clippy::too_many_arguments)]
 async fn run_loop<T: Tun + Send + 'static>(
     tun: Arc<Mutex<T>>,
     shared: Arc<Shared>,
@@ -311,6 +342,7 @@ async fn run_loop<T: Tun + Send + 'static>(
     reader_handles: Vec<JoinHandle<()>>,
     keepalive_handles: Vec<JoinHandle<()>>,
     probe_handles: Vec<JoinHandle<()>>,
+    status_server: Option<JoinHandle<()>>,
 ) {
     let mut uplink_task = tokio::spawn(uplink_loop(tun, shared.clone(), counters));
     tokio::select! {
@@ -322,6 +354,7 @@ async fn run_loop<T: Tun + Send + 'static>(
         .into_iter()
         .chain(keepalive_handles)
         .chain(probe_handles)
+        .chain(status_server)
     {
         h.abort();
     }
@@ -1089,6 +1122,7 @@ session_id: e.session_id,
             session_id,
             &[PathId::new(1)],
             "unit-test-ticket",
+            None,
         )
         .await
         .unwrap();
@@ -1217,6 +1251,7 @@ session_id: e.session_id,
             session_id,
             &[PathId::new(1), PathId::new(2)],
             "metering-test-ticket",
+            None,
         )
         .await
         .unwrap();
@@ -1278,6 +1313,7 @@ session_id: e.session_id,
             session_id,
             &[PathId::new(1), PathId::new(2)],
             "silent-path-test-ticket",
+            None,
         )
         .await
         .unwrap();
@@ -1336,6 +1372,7 @@ let m1 = handle.path_metrics(PathId::new(1)).await;
             sg_session::session_id_from_wire(0x61616161),
             &[PathId::new(1), PathId::new(2)],
             "duplication-test-ticket",
+            None,
         )
         .await
         .unwrap();

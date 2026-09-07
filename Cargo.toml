@@ -15,6 +15,10 @@ members = [
     "apps/streamguard-service",
     "apps/streamguard-gateway",
 ]
+# `desktop/` (Tauri shell, engineering step 12) is deliberately NOT a member:
+# it keeps its own Cargo.lock/toolchain so a broken UI build can never affect
+# the engine gates (`cargo check/test/clippy --workspace` from the root).
+exclude = ["desktop"]
 
 [workspace.package]
 version = "0.1.0"
@@ -27,6 +31,7 @@ anyhow = "1"
 async-trait = "0.1"
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
 quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio", "log"] }
 rcgen = "0.13"

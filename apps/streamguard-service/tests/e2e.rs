@@ -117,11 +117,12 @@ async fn client_and_gateway_engines_talk_over_two_paths() {
             probe_interval: Duration::from_secs(3600),
             probe_timeout: Duration::from_secs(3600),
             probe_failure_threshold: 2,
-            redundancy_loss_threshold: 0.0,
+redundancy_loss_threshold: 0.0,
         },
         session,
         &[PathId::new(1), PathId::new(2)],
         &token,
+        None,
     )
     .await
     .unwrap();
@@ -279,11 +280,12 @@ async fn keepalives_refresh_all_paths() {
             probe_interval: Duration::from_secs(3600),
             probe_timeout: Duration::from_secs(3600),
             probe_failure_threshold: 2,
-            redundancy_loss_threshold: 0.0,
+redundancy_loss_threshold: 0.0,
         },
         session,
         &[PathId::new(1), PathId::new(2)],
         &token,
+        None,
     )
     .await
     .unwrap();
@@ -346,11 +348,12 @@ async fn client_fails_over_when_the_active_path_dies() {
             probe_interval: Duration::from_secs(3600),
             probe_timeout: Duration::from_secs(3600),
             probe_failure_threshold: 2,
-            redundancy_loss_threshold: 0.0,
+redundancy_loss_threshold: 0.0,
         },
         session,
         &[PathId::new(1), PathId::new(2)],
         &token,
+        None,
     )
     .await
     .unwrap();
@@ -481,6 +484,7 @@ async fn client_bonds_two_healthy_paths_by_weight() {
         session,
         &[PathId::new(1), PathId::new(2)],
         &token,
+        None,
     )
     .await
     .unwrap();
@@ -632,6 +636,7 @@ async fn gateway_bonds_downlink_across_two_paths_by_advertised_weight() {
         session,
         &[PathId::new(1), PathId::new(2)],
         &token,
+        None,
     )
     .await
     .unwrap();

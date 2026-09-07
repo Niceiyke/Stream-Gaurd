@@ -6,3 +6,5 @@
 //! loops that bridge local host traffic into the tunnel.
 
 pub mod client;
+pub mod ipc;
+pub mod status;
