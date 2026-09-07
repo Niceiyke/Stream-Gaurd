@@ -9,3 +9,17 @@ description = "StreamGuard physical-interface discovery and bound-path creation"
 [dependencies]
 serde.workspace = true
 sg-core.workspace = true
+
+# RealScanner uses the OS adapter APIs (spec 7):
+#   Windows: GetAdaptersAddresses / GetIfTable2
+#   Linux:   /sys/class/net + /proc/net/route (via if-addrs for addresses)
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+if-addrs = "0.13"

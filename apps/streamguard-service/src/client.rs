@@ -40,7 +40,7 @@ use sg_multipath::{Decision, WeightedBondingScheduler};
 use sg_protocol::control::ControlMsg;
 use sg_protocol::{Envelope, PacketType, VERSION};
 use sg_session::Session;
-use sg_transport::quic::{bootstrap_v1, connect_path};
+use sg_transport::quic::{bootstrap_v1, connect_path_on_interface};
 use sg_transport::PathTransport;
 use sg_tun::Tun;
 use tokio::sync::{Mutex, oneshot};
@@ -174,6 +174,16 @@ impl<T: Tun + Send + 'static> ClientHandle<T> {
 pub struct ClientOptions {
     /// Gateway UDP/QUIC endpoint.
     pub addr: std::net::SocketAddr,
+    /// Per-path OS interface index used to bind each QUIC path's UDP socket
+    /// to one physical NIC (spec 8 "bound-path creation": each physical path
+    /// rides out its own interface so a path loss never takes a peer path
+    /// with it). Binding requires admin/root on real NICs; loopback test
+    /// suites keep this empty.
+    ///
+    /// Empty = no per-NIC binding; every path rides a plain ephemeral UDP
+    /// socket. When non-empty its length must equal `paths.len()` — `start`
+    /// bails on a mismatch. A `None` entry leaves that one path unbound.
+    pub path_interfaces: Vec<Option<u32>>,
     /// TLS SNI / certificate name expected from the gateway.
     pub server_name: String,
     /// Trusted-client QUIC configuration.
@@ -223,14 +233,29 @@ pub async fn start<T: Tun + Send + 'static>(
     let mut session = Session::new(session_id);
     let mut transports = Vec::new();
 
+    // Per-path NIC binding must line up one-for-one with the path list; an
+    // empty `path_interfaces` means "no per-NIC binding" (spec 8). Any other
+    // length is a caller bug — a silently mis-aligned `zip` would bind the
+    // wrong path to the wrong NIC.
+    if !options.path_interfaces.is_empty() && options.path_interfaces.len() != paths.len() {
+        anyhow::bail!(
+            "path_interfaces has {} entries but {} paths were given; \
+             pass one Option<u32> per path or an empty vec",
+            options.path_interfaces.len(),
+            paths.len()
+        );
+    }
+
     // Open and bind one transport per path, in the given order. The first
     // bound path becomes the initial active path; health re-ranks later.
-    for path_id in paths.iter().copied() {
-        let path = connect_path(
+    for (index, path_id) in paths.iter().copied().enumerate() {
+        let interface = options.path_interfaces.get(index).copied().flatten();
+        let path = connect_path_on_interface(
             options.addr,
             &options.server_name,
             options.client_config.clone(),
             path_id,
+            interface,
         )
         .await?;
         // Each path must present the signed session ticket before it can
@@ -1111,6 +1136,7 @@ session_id: e.session_id,
             tun,
             ClientOptions {
                 addr,
+                path_interfaces: Vec::new(),
                 server_name: "localhost".into(),
                 client_config: client_cfg,
                 keepalive_interval: Duration::from_secs(3600),
@@ -1240,6 +1266,7 @@ session_id: e.session_id,
             tun,
             ClientOptions {
                 addr,
+                path_interfaces: Vec::new(),
                 server_name: "localhost".into(),
                 client_config: client_cfg,
                 keepalive_interval: Duration::from_secs(3600),
@@ -1302,6 +1329,7 @@ session_id: e.session_id,
             tun,
             ClientOptions {
                 addr,
+                path_interfaces: Vec::new(),
                 server_name: "localhost".into(),
                 client_config: client_cfg,
                 keepalive_interval: Duration::from_secs(3600),
@@ -1361,6 +1389,7 @@ let m1 = handle.path_metrics(PathId::new(1)).await;
             LoopbackTun::with_config(TunConfig::default()),
             ClientOptions {
                 addr,
+                path_interfaces: Vec::new(),
                 server_name: "localhost".into(),
                 client_config: client_cfg,
                 keepalive_interval: Duration::from_secs(3600),

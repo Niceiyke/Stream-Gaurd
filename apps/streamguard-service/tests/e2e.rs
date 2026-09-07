@@ -107,8 +107,9 @@ async fn client_and_gateway_engines_talk_over_two_paths() {
     let token = sg_auth::issue(&secret, session, 3600);
     let mut client = client::start(
         client_tun,
-        client::ClientOptions {
+client::ClientOptions {
             addr,
+            path_interfaces: Vec::new(),
             server_name: "localhost".into(),
             client_config: client_cfg,
             // Keepalives are covered by `keepalives_refresh_all_paths`; keep
@@ -117,7 +118,7 @@ async fn client_and_gateway_engines_talk_over_two_paths() {
             probe_interval: Duration::from_secs(3600),
             probe_timeout: Duration::from_secs(3600),
             probe_failure_threshold: 2,
-redundancy_loss_threshold: 0.0,
+            redundancy_loss_threshold: 0.0,
         },
         session,
         &[PathId::new(1), PathId::new(2)],
@@ -272,15 +273,16 @@ async fn keepalives_refresh_all_paths() {
     let token = sg_auth::issue(&secret, session, 3600);
     let mut client = client::start(
         client_tun,
-        client::ClientOptions {
+client::ClientOptions {
             addr,
+            path_interfaces: Vec::new(),
             server_name: "localhost".into(),
             client_config: client_cfg,
             keepalive_interval: Duration::from_millis(30),
             probe_interval: Duration::from_secs(3600),
             probe_timeout: Duration::from_secs(3600),
             probe_failure_threshold: 2,
-redundancy_loss_threshold: 0.0,
+            redundancy_loss_threshold: 0.0,
         },
         session,
         &[PathId::new(1), PathId::new(2)],
@@ -340,15 +342,16 @@ async fn client_fails_over_when_the_active_path_dies() {
     let token = sg_auth::issue(&secret, session, 3600);
     let mut client = client::start(
         client_tun,
-        client::ClientOptions {
+client::ClientOptions {
             addr,
+            path_interfaces: Vec::new(),
             server_name: "localhost".into(),
             client_config: client_cfg,
             keepalive_interval: Duration::from_secs(3600),
             probe_interval: Duration::from_secs(3600),
             probe_timeout: Duration::from_secs(3600),
             probe_failure_threshold: 2,
-redundancy_loss_threshold: 0.0,
+            redundancy_loss_threshold: 0.0,
         },
         session,
         &[PathId::new(1), PathId::new(2)],
@@ -470,6 +473,7 @@ async fn client_bonds_two_healthy_paths_by_weight() {
         client_tun,
         client::ClientOptions {
             addr,
+            path_interfaces: Vec::new(),
             server_name: "localhost".into(),
             client_config: client_cfg,
             // Keepalives/probes parked so every counter below is attributable
@@ -622,6 +626,7 @@ async fn gateway_bonds_downlink_across_two_paths_by_advertised_weight() {
         client_tun,
         client::ClientOptions {
             addr,
+            path_interfaces: Vec::new(),
             server_name: "localhost".into(),
             client_config: client_cfg,
             // Keepalives/probes parked so every counter below is attributable

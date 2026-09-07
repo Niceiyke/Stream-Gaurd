@@ -93,14 +93,53 @@ impl GatewayQuic {
 }
 
 /// Client-side QUIC connection to the gateway for one physical path.
+///
+/// Runs on the plain ephemeral UDP socket. Use
+/// [`connect_path_on_interface`] to ride a specific physical NIC out.
 pub async fn connect_path(
     addr: SocketAddr,
     server_name: &str,
     config: quinn::ClientConfig,
     path_id: PathId,
 ) -> Result<QuicPathTransport> {
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().expect("static bind address"))
-        .map_err(|e| Error::io(e.to_string()))?;
+    connect_path_on_interface(addr, server_name, config, path_id, None).await
+}
+
+/// Client-side QUIC connection to the gateway for one physical path.
+///
+/// When `interface_index` is `Some(idx)` the client creates its own UDP
+/// socket bound to that NIC (spec 8 "bound-path creation": each physical
+/// path rides out its own interface so a path loss never takes a peer path
+/// with it). Binding requires admin/root on real NICs; the loopback test
+/// suites keep this `None` and use the plain unbound socket.
+pub async fn connect_path_on_interface(
+    addr: SocketAddr,
+    server_name: &str,
+    config: quinn::ClientConfig,
+    path_id: PathId,
+    interface_index: Option<u32>,
+) -> Result<QuicPathTransport> {
+    let mut endpoint = match interface_index {
+        // A per-interface bound socket: build it ourselves with socket2
+        // (which gives us the raw handle to set the platform unicast-IF
+        // option), then hand it to a quinn endpoint over the same NIC.
+        Some(idx) => {
+            let socket = bound_udp_socket(idx)?;
+            let udp: std::net::UdpSocket = socket.into();
+            let runtime = quinn::default_runtime()
+                .ok_or_else(|| Error::transport("quinn runtime-tokio feature not enabled"))?;
+            quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                None,
+                udp,
+                runtime,
+            )
+            .map_err(|e| Error::io(e.to_string()))?
+        }
+        // Unbound path: keep the existing plain one-socket-per-path endpoint.
+        None => quinn::Endpoint::client("0.0.0.0:0".parse().expect("static bind address"))
+            .map_err(|e| Error::io(e.to_string()))?,
+    };
     endpoint.set_default_client_config(config);
     let conn = endpoint
         .connect(addr, server_name)
@@ -108,6 +147,71 @@ pub async fn connect_path(
         .await
         .map_err(|e| Error::transport(format!("handshake failed: {e}")))?;
     Ok(QuicPathTransport::new(conn, path_id))
+}
+
+/// Builds a UDP socket bound only to the NIC with the given interface index.
+///
+/// The IPv4 unicast source-interface option is platform-specific:
+///
+/// - Windows: `IP_UNICAST_IF` (IPPROTO_IP=0, opt 31) with the interface
+///   index in network byte order — i.e. its bytes swapped from the native
+///   order, per the WinSock docs. socket2 0.5 exposes no raw `setsockopt`,
+///   so we call the WinSock one directly.
+/// - Linux: `IP_BOUND_IF` (index-based, kernel >= 5.7) via
+///   `socket2::Socket::bind_device_by_index_v4`.
+/// - Other targets: left unbound (the caller still gets a usable socket).
+fn bound_udp_socket(interface_index: u32) -> Result<socket2::Socket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .map_err(|e| Error::io(e.to_string()))?;
+    socket
+        .set_reuse_address(false)
+        .map_err(|e| Error::io(e.to_string()))?;
+    socket
+        .bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into())
+        .map_err(|e| Error::io(e.to_string()))?;
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket as _;
+        let level = windows::Win32::Networking::WinSock::IPPROTO_IP;
+        const IP_UNICAST_IF: i32 = 31;
+        // WinSock stores the interface index in network byte order, so the
+        // DWORD/UINT32 must be byte-swapped on a little-endian host.
+        let optval: u32 = interface_index.swap_bytes();
+        let rc = unsafe {
+            windows::Win32::Networking::WinSock::setsockopt(
+                windows::Win32::Networking::WinSock::SOCKET(socket.as_raw_socket() as usize),
+                level.0,
+                IP_UNICAST_IF,
+                Some(&optval.to_ne_bytes()),
+            )
+        };
+        if rc != 0 {
+            return Err(Error::platform(format!(
+                "IP_UNICAST_IF failed for interface index {interface_index}: winsock error {rc}"
+            )));
+        }
+    }
+    #[cfg(all(target_os = "linux", not(windows)))]
+    {
+        let index = std::num::NonZeroU32::new(interface_index).ok_or_else(|| {
+            Error::platform("interface index 0 is invalid for socket binding")
+        })?;
+        socket
+            .bind_device_by_index_v4(Some(index))
+            .map_err(|e| Error::io(e.to_string()))?;
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        let _ = interface_index;
+        // No portable per-NIC unicast binding on this target: leave unbound.
+    }
+
+    Ok(socket)
 }
 
 /// Performs the v1 bootstrap handshake on a fresh path (spec 15.5 /

@@ -31,7 +31,7 @@ cargo clippy --workspace --all-targets   # must stay clean
 
 ## Code conventions
 
-- `ClientOptions` has **no `Default` impl**; every field is set at all 6 construction sites (3 in `apps/streamguard-service/tests/e2e.rs`, 3 in `client.rs` unit tests). Adding a field means updating all 6, or the build breaks.
+- `ClientOptions` has **no `Default` impl**; every field is set at all construction sites (5 in `apps/streamguard-service/tests/e2e.rs`, 4 in `client.rs` unit tests, plus `status_ipc.rs`, `sg-wordlyte` integration, and `apps/streamguard-service/src/main.rs` — 12 today, and `main.rs` must always mirror this when wired). Adding a field means updating every site, or the build breaks.
 - `PathMetrics::default()` has `reachable: false`. Fresh path entries must be inserted as `PathMetrics { reachable: true, ..Default::default() }` — unmetered = eligible. `or_default()` here makes `fail_path` early-return forever.
 - Lock order: never hold `metrics` while acquiring `session`; `session → metrics` and `probes → metrics` are fine. `fail_path` is idempotent (early-returns when the path is already unreachable) — keep it that way, counters depend on it.
 
@@ -42,6 +42,17 @@ cargo clippy --workspace --all-targets   # must stay clean
 - Assertions read counters: `handle.counters().await.frames_to_host`, `duplicates_dropped`, `sessions`, `keepalives`, `probes_replied`, plus client-side `probes_sent`/`soft_failures`/`duplicates_sent`.
 - `.gitattributes` forces LF for `.rs` (git may warn "LF will be replaced by CRLF" on `Cargo.lock` — harmless). `wintun-*.zip` is a gitignored build artifact; never commit binaries/DLLs.
 
+### Running locally
+
+Two terminals on one host (both read the same env values — the secret **must match**, that is the whole auth contract, spec 22):
+
+| Terminal | Command |
+| --- | --- |
+| Gateway | `$env:STREAMGUARD_SECRET = 'dev-secret'; cargo run -p streamguard-gateway` (Writes `./sgcerts/cert.der` + `key.der` on first run.) |
+| Service | `$env:STREAMGUARD_SECRET = 'dev-secret'; $env:STREAMGUARD_ADDR = '127.0.0.1:12423'; cargo run -p streamguard-service` (Reads `./sgcerts/cert.der` as the TLS trust anchor; keep both working dirs in sync or set `STREAMGUARD_CERT_DIR` explicitly.) |
+
+Then the status shell: `cd desktop; cargo tauri dev -- --pipe \\.\pipe\streamguard-status --token <ticket>` (or `--addr 127.0.0.1:9100` on non-Windows). Optional knobs: `STREAMGUARD_PORT` (gateway, default 12423), `STREAMGUARD_SESSION` (service, hex session prefix), `STREAMGUARD_DEV=1` (both, in-memory TUN). Real adapters need `--features sg-tun/native-tun` on *both* binaries plus `WINTUN_DLL` pointing at `wintun.dll` on Windows — keep `native-tun` opt-in, never default-on in gates.
+
 ## Milestone status
 
-Engineering sequence is spec §28. Committed so far: steps 1-10 plus 12-16 — probes `8b88eaf`, active/standby failover `1073978`, adaptive duplication `9086e0f`, reorder buffer `bb2d06e`, weighted scheduling/bonding (step 14) `1b6515b` + downlink mirror `c290df8`, status plane (step 12 T1) `6b3cea7` + Tauri shell (step 12 T2) `4130da4`, WFP selected-app scaffold (step 15) `d99b29a`, Wordlyte SDK (step 16) `da0ae3c` + `StatusProvider::from_snapshot_fn` seam `c3418ed`. Remaining: step 11 (live egress unplug test, spec §27 — needs two real NICs and admin; only the scaffold/harness can be done here). Real-platform verification still outstanding: WFP ALE filters need an elevated run with real app paths; the Tauri/Wordlyte UI needs the engine service publishing the pipe in production.
+Engineering sequence is spec §28. Committed so far: steps 1-10 plus 12-16 — probes `8b88eaf`, active/standby failover `1073978`, adaptive duplication `9086e0f`, reorder buffer `bb2d06e`, weighted scheduling/bonding (step 14) `1b6515b` + downlink mirror `c290df8`, status plane (step 12 T1) `6b3cea7` + Tauri shell (step 12 T2) `4130da4`, WFP selected-app scaffold (step 15) `d99b29a`, Wordlyte SDK (step 16) `da0ae3c` + `StatusProvider::from_snapshot_fn` seam `c3418ed`. Real-platform wiring: per-interface QUIC binding (`connect_path_on_interface`, spec 8), `ClientOptions.path_interfaces`, sg-network `RealScanner` (GetAdaptersAddresses + GetIfTable2 / if-addrs), and both binaries as real launchers (env-driven, rcgen cert trust anchor, shared-secret → bootstrap ticket, status pipe published by the service by default). Remaining: step 11 (live egress unplug test, spec §27 — needs two real NICs and admin; only the scaffold/harness can be done here). Real-platform verification still outstanding: WFP ALE filters need an elevated run with real app paths; per-NIC binding needs an elevated admin/NICs run.

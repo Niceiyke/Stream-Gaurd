@@ -91,6 +91,7 @@ impl Fixture {
             client_tun,
             client::ClientOptions {
                 addr,
+                path_interfaces: Vec::new(),
                 server_name: "localhost".into(),
                 client_config: client_cfg,
                 keepalive_interval: Duration::from_secs(3600),

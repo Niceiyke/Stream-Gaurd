@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
+rcgen.workspace = true
 sg-auth.workspace = true
 sg-core.workspace = true
 sg-multipath.workspace = true
@@ -28,7 +29,6 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 bytes.workspace = true
 quinn.workspace = true
-rcgen.workspace = true
 sg-core.workspace = true
 sg-multipath.workspace = true
 sg-protocol.workspace = true

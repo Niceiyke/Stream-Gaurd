@@ -139,6 +139,7 @@ impl Fixture {
             client_tun,
             client::ClientOptions {
                 addr,
+                path_interfaces: Vec::new(),
                 server_name: "localhost".into(),
                 client_config: client_cfg,
                 // Keepalives/probes parked: deterministic counters.

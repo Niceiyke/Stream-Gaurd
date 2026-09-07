@@ -20,8 +20,18 @@ quinn = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 sg-core.workspace = true
 sg-protocol.workspace = true
+socket2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+# WinSock-based per-NIC unicast binding (interface index via IP_UNICAST_IF).
+# The `IP_UNICAST_IF` socket option is Windows-only; socket2 0.5 does not
+# expose a raw setsockopt, so we call the WinSock `setsockopt` directly.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+] }
 
 [dev-dependencies]
 rcgen.workspace = true
