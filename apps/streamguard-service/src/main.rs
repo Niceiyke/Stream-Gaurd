@@ -22,13 +22,14 @@
 //!   `\\.\pipe\streamguard-status`). Non-Windows hosts use loopback TCP
 //!   127.0.0.1:9100 instead.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use sg_core::SessionId;
-use sg_network::{InterfaceScanner, InterfaceKind, InterfaceState, NullScanner, PathMap, RealScanner};
+use sg_core::{PathId, SessionId};
+use sg_network::{InterfaceScanner, NullScanner, PathMap, RealScanner};
 use sg_session::session_id_from_wire;
 use sg_transport::quic::client_tls;
 use sg_tun::{LoopbackTun, Tun, TunConfig};
@@ -138,17 +139,15 @@ async fn main() -> anyhow::Result<()> {
             NullScanner.list()?
         }
     };
-    let physical: Vec<_> = interfaces
-        .iter()
-        .filter(|i| i.kind != InterfaceKind::Virtual && i.state == InterfaceState::Up)
-        .collect();
-    // If the strict filter drains everything (e.g. a phone-tether host with
-    // only Unknown/Dormant adapters), fall back to the whole enumerated set.
-    let chosen: Vec<&sg_network::Interface> = if physical.is_empty() {
-        interfaces.iter().collect()
-    } else {
-        physical
-    };
+    // Highest-confidence physical paths first: Up, not loopback/virtual, and
+    // carrying a default gateway (spec 7 "route suitability" — a path that
+    // cannot reach the internet is useless). Hyper-V/WSL/VirtualBox adapters
+    // report as Ethernet on Windows, so relying on `kind` alone leaks dozens
+    // of virtual bridges into the path table; the gateway + loopback filter
+    // is the reliable discriminator. Shared with the engine's rescan loop so
+    // both use the exact same candidate rule (extracted to client.rs).
+    let chosen: Vec<&sg_network::Interface> =
+        streamguard_service::client::filter_candidates(&interfaces);
     if chosen.is_empty() {
         anyhow::bail!(
             "no network interfaces discovered; cannot build bound paths \
@@ -158,12 +157,17 @@ async fn main() -> anyhow::Result<()> {
     let mut path_map = PathMap::new();
     let mut path_ids = Vec::with_capacity(chosen.len());
     let mut path_interfaces = Vec::with_capacity(chosen.len());
+    // Friendly interface names per path for the status dashboard ("Wi-Fi",
+    // "Ethernet", …). Pushed into the handle after `start()` so the rescan
+    // loop and the status plane share them (spec 21 path rows).
+    let mut path_names: HashMap<PathId, String> = HashMap::new();
     // Dev simulation talks to a 127.0.0.1 gateway; per-NIC bound sockets
     // cannot route to loopback, so dev forces unbound paths (spec 8).
     let dev_binding_free = std::env::var_os("STREAMGUARD_DEV").is_some();
     for iface in chosen {
         let path = path_map.id_for(iface);
         path_ids.push(path);
+        path_names.insert(path, iface.id.clone());
         // index 0 means "no reportable index" on that platform -> unbound.
         // Effective per-interface binding only when NOT in dev simulation.
         path_interfaces.push(
@@ -258,6 +262,11 @@ async fn main() -> anyhow::Result<()> {
     )
     .await
     .context("starting the client engine (is the gateway up?)")?;
+
+    // Publish the friendly interface names for the status dashboard (spec 21
+    // path rows). The rescan loop updates this map as interfaces appear and
+    // disappear; the initial set is what the user sees at startup.
+    handle.set_path_names(path_names).await;
 
     tracing::info!(
         gateway = %addr,

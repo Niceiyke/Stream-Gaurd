@@ -229,6 +229,7 @@ async fn controlled_snapshot_with_warnings_round_trips() {
         mode: Mode::ActiveStandby,
         paths: vec![PathStatus {
             path_id: 1,
+            name: Some("Ethernet".to_string()),
             reachable: true,
             rtt_ms: 18,
             srtt_ms: 17,

@@ -184,10 +184,20 @@ impl Fixture {
 }
 
 /// The engine publishes a live, accurate snapshot: Bonding mode, both paths,
-/// and counters that move with real traffic.
+/// friendly interface names (feature: status dashboard), and counters that
+/// move with real traffic.
 #[tokio::test]
 async fn status_plane_reports_live_engine_snapshot() {
     let mut fx = Fixture::spawn(status_endpoint("live")).await;
+
+    // Post-start name wiring (main.rs does this after `start()` returns):
+    // the snapshot must carry the friendly names to the UI.
+    fx.client
+        .set_path_names(std::collections::HashMap::from([
+            (PathId::new(1), "Wi-Fi".to_string()),
+            (PathId::new(2), "Ethernet".to_string()),
+        ]))
+        .await;
 
     let mut session = StatusClient::for_session(fx.endpoint.clone(), &fx.token, fx.session)
         .connect()
@@ -197,6 +207,12 @@ async fn status_plane_reports_live_engine_snapshot() {
     assert_eq!(snap.mode, Mode::Bonding, "both paths unmetered = eligible");
     assert!(snap.protecting, "bonding protects the session");
     assert_eq!(snap.paths.len(), 2);
+    let names: Vec<Option<String>> = snap.paths.iter().map(|p| p.name.clone()).collect();
+    assert_eq!(
+        names,
+        vec![Some("Wi-Fi".to_string()), Some("Ethernet".to_string())],
+        "paths ordered by id carry the friendly interface names"
+    );
     assert!(snap.active_path.is_some(), "the engine picked an active path");
     assert_eq!(snap.counters.status_auth_failures, 0);
 

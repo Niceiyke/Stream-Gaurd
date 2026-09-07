@@ -340,6 +340,7 @@ mod tests {
             paths: vec![
                 PathStatus {
                     path_id: 1,
+                    name: Some("Wi-Fi".to_string()),
                     reachable: true,
                     rtt_ms: 25,
                     srtt_ms: 20,
@@ -350,6 +351,7 @@ mod tests {
                 },
                 PathStatus {
                     path_id: 2,
+                    name: Some("Ethernet".to_string()),
                     reachable: true,
                     rtt_ms: 40,
                     srtt_ms: 35,

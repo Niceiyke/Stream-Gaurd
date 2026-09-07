@@ -48,6 +48,9 @@ pub enum Mode {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PathStatus {
     pub path_id: u8,
+    /// Friendly interface name (e.g. "Wi-Fi", "Ethernet"); `None` when the
+    /// engine has no name for the path (dashboard renders "—").
+    pub name: Option<String>,
     pub reachable: bool,
     pub rtt_ms: u32,
     pub srtt_ms: u32,
@@ -175,8 +178,19 @@ impl StatusProvider {
                     let m = shared.metrics.lock().await;
                     m.clone()
                 };
+                let path_names = {
+                    let n = shared.path_names.lock().await;
+                    n.clone()
+                };
                 let counters = counters.lock().await.clone();
-                project_snapshot(session_id, active, path_ids, &metrics, &counters)
+                project_snapshot(
+                    session_id,
+                    active,
+                    path_ids,
+                    &metrics,
+                    &counters,
+                    &path_names,
+                )
             }
             StatusSource::Fixed(f) => f(),
         }
@@ -192,6 +206,7 @@ fn project_snapshot(
     path_ids: Vec<PathId>,
     metrics: &HashMap<PathId, PathMetrics>,
     counters: &Counters,
+    path_names: &HashMap<PathId, String>,
 ) -> StatusSnapshot {
     let prefix = session_prefix(session_id);
     let mut paths = Vec::with_capacity(path_ids.len());
@@ -231,6 +246,7 @@ fn project_snapshot(
             };
         paths.push(PathStatus {
             path_id: pid.get(),
+            name: path_names.get(&pid).cloned(),
             reachable,
             rtt_ms,
             srtt_ms,
@@ -304,20 +320,27 @@ mod tests {
                 ..Default::default()
             },
         );
+        let path_names = HashMap::from([
+            (PathId::new(1), "Wi-Fi".to_string()),
+            (PathId::new(2), "Ethernet".to_string()),
+        ]);
         let snap = project_snapshot(
             session_id_from_wire(prefix),
             Some(PathId::new(1)),
             vec![PathId::new(2), PathId::new(1)],
             &metrics,
             &Counters::default(),
+            &path_names,
         );
         assert_eq!(snap.session_prefix, prefix);
         assert!(snap.protecting);
         assert_eq!(snap.mode, Mode::Bonding);
         assert_eq!(snap.paths.len(), 2);
         assert_eq!(snap.paths[0].path_id, 1, "rows sorted by path id");
+        assert_eq!(snap.paths[0].name.as_deref(), Some("Wi-Fi"));
         assert_eq!(snap.paths[0].srtt_ms, 20);
         assert_eq!(snap.paths[1].path_id, 2);
+        assert_eq!(snap.paths[1].name.as_deref(), Some("Ethernet"));
         assert_eq!(
             snap.aggregate_kbps,
             54_000,
@@ -358,6 +381,7 @@ mod tests {
             vec![PathId::new(1), PathId::new(2)],
             &metrics,
             &Counters::default(),
+            &HashMap::new(),
         );
         assert!(snap.protecting, "one eligible path still protects traffic");
         assert_eq!(snap.mode, Mode::ActiveStandby);
@@ -387,6 +411,7 @@ mod tests {
             vec![PathId::new(1)],
             &metrics,
             &Counters::default(),
+            &HashMap::new(),
         );
         assert!(!snap.protecting);
         assert_eq!(snap.mode, Mode::SinglePath);
@@ -408,6 +433,7 @@ mod tests {
             vec![PathId::new(1), PathId::new(2)],
             &HashMap::new(),
             &Counters::default(),
+            &HashMap::new(),
         );
         assert!(snap.protecting);
         assert_eq!(snap.mode, Mode::Bonding);

@@ -8,8 +8,9 @@
 //                     paths:[PathStatus], aggregate_kbps:u32,
 //                     active_path:u8|null, counters:StatusCounters,
 //                     warnings:[string] }
-//   PathStatus:     { path_id:u8, reachable:bool, rtt_ms, srtt_ms, jitter_ms,
-//                     loss:f32, available_kbps:u32, stability_secs:u64 }
+//   PathStatus:     { path_id:u8, name:string|null, reachable:bool, rtt_ms,
+//                     srtt_ms, jitter_ms, loss:f32, available_kbps:u32,
+//                     stability_secs:u64 }
 //   Mode:           "SinglePath" | "ActiveStandby" | "Bonding"
 //   StatusCounters: frames_to_host, datagrams_to_gateway, duplicates_dropped,
 //                   keepalives, path_selects, path_failures, soft_failures,
@@ -100,11 +101,12 @@ function render(snapshot) {
   dom.pathsBody.innerHTML = "";
   if (paths.length === 0) {
     const tr = document.createElement("tr");
-    tr.innerHTML = '<td colspan="8" class="empty">no paths reported</td>';
+    tr.innerHTML = '<td colspan="9" class="empty">no paths reported</td>';
     dom.pathsBody.appendChild(tr);
   } else {
     for (const p of paths) {
       const tr = document.createElement("tr");
+      const name = p.name || "—";
       const reachable = p.reachable ? "reachable" : "down";
       const rtt = p.rtt_ms === undefined ? "—" : p.rtt_ms;
       const srtt = p.srtt_ms === undefined ? "—" : p.srtt_ms;
@@ -114,6 +116,7 @@ function render(snapshot) {
       const stab = p.stability_secs === undefined ? "—" : p.stability_secs;
       tr.innerHTML =
         `<td><span class="badge badge-path">path ${p.path_id}</span></td>` +
+        `<td>${name}</td>` +
         `<td><span class="badge ${reachable === "reachable" ? "badge-on" : "badge-off"}">${reachable}</span></td>` +
         `<td>${rtt}</td>` +
         `<td>${srtt}</td>` +

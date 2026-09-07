@@ -40,6 +40,7 @@ use sg_multipath::{Decision, WeightedBondingScheduler};
 use sg_protocol::control::ControlMsg;
 use sg_protocol::{Envelope, PacketType, VERSION};
 use sg_session::Session;
+use sg_network::{InterfaceKind, InterfaceScanner, InterfaceState, PathMap, RealScanner};
 use sg_transport::quic::{bootstrap_v1, connect_path_on_interface};
 use sg_transport::PathTransport;
 use sg_tun::Tun;
@@ -50,6 +51,13 @@ use tokio::task::JoinHandle;
 pub(crate) struct Shared {
     pub(crate) session: Mutex<Session>,
     pub(crate) metrics: Mutex<HashMap<PathId, PathMetrics>>,
+    /// Friendly interface name per path (spec 21 "path quality" row), set
+    /// from the interface scanner and surfaced in the status snapshot.
+    pub(crate) path_names: Mutex<HashMap<PathId, String>>,
+    /// Instant each path's `reachable` state last changed; drives
+    /// `PathMetrics.stability_secs` (spec 21). Absent = watched since the
+    /// engine started or the path (re)connected — see `record_health`.
+    pub(crate) health_changed_at: Mutex<HashMap<PathId, std::time::Instant>>,
     /// The last active path the gateway was told about (downlink target).
     /// `None` before the first uplink decision.
     pub(crate) notified: Mutex<Option<PathId>>,
@@ -135,6 +143,13 @@ impl<T: Tun + Send + 'static> ClientHandle<T> {
 
     pub async fn counters(&self) -> Counters {
         self.counters.lock().await.clone()
+    }
+
+    /// Updates the friendly interface names shown in the status dashboard.
+    /// Called from `main.rs` after `start()` returns with the initial
+    /// interface-to-PathId mapping.
+    pub async fn set_path_names(&self, names: HashMap<PathId, String>) {
+        *self.shared.path_names.lock().await = names;
     }
 
     /// Updates the health snapshot for `path_id` so the uplink loop can
@@ -269,6 +284,11 @@ pub async fn start<T: Tun + Send + 'static>(
         session.add_path(path, path_id)?;
     }
 
+    // The initial path count is observable via `Counters.paths` (main.rs
+    // logs it at startup); the rescan loop keeps this counter truthful as
+    // paths are added/removed at runtime (spec 31.5).
+    counters.lock().await.paths = paths.len() as u64;
+
     let initial_active = session.active_path();
     let shared = Arc::new(Shared {
         session: Mutex::new(session),
@@ -279,6 +299,8 @@ pub async fn start<T: Tun + Send + 'static>(
         redundancy_loss_threshold: options.redundancy_loss_threshold,
         scheduler: Mutex::new(WeightedBondingScheduler::default()),
         notified_weights: Mutex::new(None),
+        path_names: Mutex::new(HashMap::new()),
+        health_changed_at: Mutex::new(HashMap::new()),
     });
 
     // Spawn one downlink reader per bound path, one keepalive task if a
@@ -336,6 +358,25 @@ pub async fn start<T: Tun + Send + 'static>(
         None => None,
     };
 
+    // Live rescan loop (spec 31.5): re-enumerates interfaces every 5s and
+    // adds/removes session paths as interfaces appear/disappear. New paths
+    // follow the initial binding policy: when every initial path ran unbound
+    // (dev simulation or an empty `path_interfaces`), new paths are unbound
+    // too — loopback/dev gateways cannot route per-NIC bound sockets.
+    let dev_binding_free = options.path_interfaces.is_empty()
+        || options.path_interfaces.iter().all(|o| o.is_none());
+    let rescan_handle = tokio::spawn(rescan_loop(
+        tun.clone(),
+        shared.clone(),
+        counters.clone(),
+        options.addr,
+        options.server_name.clone(),
+        options.client_config.clone(),
+        session_id,
+        token.to_string(),
+        dev_binding_free,
+    ));
+
     let run = tokio::spawn(run_loop(
         tun.clone(),
         shared.clone(),
@@ -345,6 +386,7 @@ pub async fn start<T: Tun + Send + 'static>(
         keepalive_handles,
         probe_handles,
         status_task,
+        rescan_handle,
     ));
 
     Ok(ClientHandle {
@@ -368,6 +410,7 @@ async fn run_loop<T: Tun + Send + 'static>(
     keepalive_handles: Vec<JoinHandle<()>>,
     probe_handles: Vec<JoinHandle<()>>,
     status_server: Option<JoinHandle<()>>,
+    rescan_handle: JoinHandle<()>,
 ) {
     let mut uplink_task = tokio::spawn(uplink_loop(tun, shared.clone(), counters));
     tokio::select! {
@@ -380,6 +423,7 @@ async fn run_loop<T: Tun + Send + 'static>(
         .chain(keepalive_handles)
         .chain(probe_handles)
         .chain(status_server)
+        .chain(std::iter::once(rescan_handle))
     {
         h.abort();
     }
@@ -445,8 +489,7 @@ match envelope.packet_type {
                 }
                 if let Some(sent_at) = sent_at {
                     let rtt = probe_rtt_ms(&sent_at);
-                    let mut m = shared.metrics.lock().await;
-                    m.entry(path_id).or_default().record_probe(Some(rtt));
+                    record_health(&shared, path_id, rtt).await;
                 }
             }
             // Control / Keepalive / Probe are handled by the holding logic in
@@ -670,6 +713,9 @@ async fn fail_path(shared: Arc<Shared>, counters: Arc<Mutex<Counters>>, dead: Pa
             ..Default::default()
         };
     }
+    // Path changed health state: drop the stability clock so the next
+    // successful probe restarts stability_secs from zero (spec 21).
+    shared.health_changed_at.lock().await.remove(&dead);
     {
         let mut c = counters.lock().await;
         if soft {
@@ -706,6 +752,35 @@ async fn fail_path(shared: Arc<Shared>, counters: Arc<Mutex<Counters>>, dead: Pa
 // ---------------------------------------------------------------------------
 // Health probe task – one per path; feeds the health engine + soft expiry
 // ---------------------------------------------------------------------------
+
+/// Records one successful probe observation and updates `stability_secs`.
+///
+/// `PathMetrics::record_probe` smooths the RTT/loss state but never touches
+/// `stability_secs`; that field is "seconds since the path last changed
+/// health state" (spec 21). We track the instant a path's `reachable` flag
+/// last flipped in `Shared.health_changed_at`: when a path transitions to
+/// reachable the clock resets, and while it stays reachable the elapsed time
+/// is written back on each probe (roughly 1 Hz cadence). Lock order
+/// `metrics → health_changed_at` is safe (no `session` is involved, and both
+/// are touched here alone).
+async fn record_health(shared: &Arc<Shared>, path_id: PathId, rtt_ms: u32) {
+    let now = std::time::Instant::now();
+    let mut m = shared.metrics.lock().await;
+    let was_reachable = m.get(&path_id).map(|pm| pm.reachable).unwrap_or(false);
+    m.entry(path_id).or_default().record_probe(Some(rtt_ms));
+    let mut clocks = shared.health_changed_at.lock().await;
+    if !was_reachable {
+        // Just came up: (re)start the stability clock.
+        clocks.insert(path_id, now);
+        if let Some(pm) = m.get_mut(&path_id) {
+            pm.stability_secs = 0;
+        }
+    } else if let Some(start) = clocks.get(&path_id).copied() {
+        if let Some(pm) = m.get_mut(&path_id) {
+            pm.stability_secs = now.saturating_duration_since(start).as_secs();
+        }
+    }
+}
 
 /// Emits a per-path health probe (spec 31.3) and drives the soft-failure
 /// arbiter: a probe that is not answered within `probe_timeout` counts as
@@ -790,6 +865,277 @@ async fn probe_loop(
         if failure_threshold > 0 && total_misses >= failure_threshold {
             shared.probe_misses.lock().await.remove(&path_id);
             fail_path(shared.clone(), counters.clone(), path_id, true).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interface candidate filter (shared by main.rs and rescan_loop)
+// ---------------------------------------------------------------------------
+
+/// Filters discovered interfaces down to the physical paths suitable for
+/// tunnel binding (spec 7 "route suitability"):
+///   1. Strict: Up + not Virtual + has default gateway + ifindex != 0
+///   2. Fallback (when strict yields nothing): Up + not Virtual
+///
+/// Public because the service binary (`main.rs`) is a separate crate from the
+/// engine library and must use exactly the same filter as the rescan loop.
+pub fn filter_candidates(interfaces: &[sg_network::Interface]) -> Vec<&sg_network::Interface> {
+    let is_candidate = |i: &sg_network::Interface| {
+        i.state == InterfaceState::Up
+            && i.kind != InterfaceKind::Virtual
+            && i.gateway.is_some()
+            && i.ifindex != 0
+    };
+    let physical: Vec<_> = interfaces.iter().filter(|i| is_candidate(i)).collect();
+    if physical.is_empty() {
+        interfaces
+            .iter()
+            .filter(|i| i.state == InterfaceState::Up && i.kind != InterfaceKind::Virtual)
+            .collect()
+    } else {
+        physical
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live rescan loop – adds/removes paths as interfaces appear/disappear
+// ---------------------------------------------------------------------------
+
+/// Ticks (each 5 s) an interface must stay absent from the scan before its
+/// path is removed. Two ticks ≈ 10 s of confirmed absence — long enough to
+/// ride out a transient GetAdaptersAddresses miss, short enough that a real
+/// unplug is reflected within a few seconds (spec 31.4 hysteresis).
+const RESCAN_GRACE_TICKS: u32 = 2;
+
+/// Per-path task handles the rescan loop spawns for a dynamically added path
+/// (reader, keepalive, probe) — aborted in lockstep when the path is removed.
+type PathTasks = (JoinHandle<()>, JoinHandle<()>, JoinHandle<()>);
+
+/// Periodically re-enumerates host interfaces via `RealScanner` and
+/// reconciles the set of bound session paths:
+///
+/// - **New interface** that passes the candidate filter → connect, bootstrap,
+///   add to session, spawn per-path reader/keepalive/probe tasks.
+/// - **Gone interface** (unreachable + absent from scan) → remove from
+///   session, abort per-path tasks, clean up metrics/names/probe state.
+///
+/// The rescan loop owns its own `PathMap` for consistent PathId assignment:
+/// re-plugged interfaces receive the same PathId they had before (spec 31.5).
+#[allow(clippy::too_many_arguments)]
+async fn rescan_loop<T: Tun + Send + 'static>(
+    tun: Arc<Mutex<T>>,
+    shared: Arc<Shared>,
+    counters: Arc<Mutex<Counters>>,
+    addr: std::net::SocketAddr,
+    server_name: String,
+    client_config: quinn::ClientConfig,
+    session_id: SessionId,
+    token: String,
+    dev_binding_free: bool,
+) {
+    let mut path_map = PathMap::new();
+    let mut tracked: HashMap<PathId, PathTasks> = HashMap::new();
+    // Consecutive ticks an interface has been absent from the candidate scan.
+    // A path is only removed after it stays gone for GRACE_TICKS consecutive
+    // ticks, so a transient scan miss does not flap the path (spec 31.4
+    // hysteresis). Prevents removing a live loopback/dev path the instant a
+    // physical NIC's status flickers.
+    let mut absent_for: HashMap<PathId, u32> = HashMap::new();
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // Scan current host interfaces.
+        let interfaces = match RealScanner.list() {
+            Ok(ifaces) => ifaces,
+            Err(err) => {
+                tracing::warn!(error = %err, "rescan: RealScanner failed; skipping tick");
+                continue;
+            }
+        };
+
+        let candidates = filter_candidates(&interfaces);
+
+        // Collect candidate PathIds for this tick.
+        let mut candidate_ids: Vec<(PathId, &sg_network::Interface)> = Vec::new();
+        for iface in &candidates {
+            let pid = path_map.id_for(iface);
+            candidate_ids.push((pid, iface));
+        }
+        let candidate_set: std::collections::HashSet<PathId> =
+            candidate_ids.iter().map(|(pid, _)| *pid).collect();
+
+        // Snapshot current session paths.
+        let current_paths: Vec<PathId> = {
+            let sess = shared.session.lock().await;
+            sess.path_ids().collect()
+        };
+
+        // --- Add new paths (interface present in scan but not in session) ---
+        for (pid, iface) in &candidate_ids {
+            if current_paths.contains(pid) {
+                continue;
+            }
+            // New interface: connect, bootstrap, add to session.
+            tracing::info!(
+                iface = %iface.name,
+                ifindex = iface.ifindex,
+                path = pid.get(),
+                "rescan: adding new path"
+            );
+            let ifindex = if dev_binding_free {
+                None
+            } else {
+                (iface.ifindex != 0).then_some(iface.ifindex)
+            };
+            let path = match connect_path_on_interface(
+                addr,
+                &server_name,
+                client_config.clone(),
+                *pid,
+                ifindex,
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        path = pid.get(),
+                        "rescan: connect_path_on_interface failed"
+                    );
+                    continue;
+                }
+            };
+            let accredited = match bootstrap_v1(&path, session_id, &token).await {
+                Ok(sid) => sid,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        path = pid.get(),
+                        "rescan: bootstrap_v1 failed"
+                    );
+                    continue;
+                }
+            };
+            if accredited != session_id {
+                tracing::warn!(
+                    expected = ?session_id,
+                    got = ?accredited,
+                    path = pid.get(),
+                    "rescan: gateway accredited wrong session"
+                );
+                continue;
+            }
+            let transport: Arc<dyn PathTransport> = Arc::new(path);
+            if let Err(err) = shared.session.lock().await.add_path(transport.clone(), *pid) {
+                tracing::warn!(
+                    error = %err,
+                    path = pid.get(),
+                    "rescan: session.add_path failed (already bound?)"
+                );
+                continue;
+            }
+
+            // Spawn per-path tasks (same tuning as start()).
+            let reader = tokio::spawn(reader_loop(
+                transport.clone(),
+                *pid,
+                tun.clone(),
+                shared.clone(),
+                counters.clone(),
+            ));
+            let keepalive = tokio::spawn(keepalive_loop(
+                transport.clone(),
+                *pid,
+                session_id,
+                Duration::from_secs(20),
+                counters.clone(),
+                shared.clone(),
+            ));
+            let probe = tokio::spawn(probe_loop(
+                transport,
+                *pid,
+                session_id,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                2,
+                counters.clone(),
+                shared.clone(),
+            ));
+            tracked.insert(*pid, (reader, keepalive, probe));
+
+            // Update friendly name for the status dashboard.
+            shared
+                .path_names
+                .lock()
+                .await
+                .insert(*pid, iface.id.clone());
+
+            // Insert fresh metrics entry so the path is eligible.
+            shared.metrics.lock().await.entry(*pid).or_insert_with(|| PathMetrics {
+                reachable: true,
+                ..Default::default()
+            });
+
+            let session_count = {
+                let sess = shared.session.lock().await;
+                sess.path_count()
+            };
+            counters.lock().await.paths = session_count as u64;
+        }
+
+        // --- Remove gone paths (interface absent from candidate scan) ---
+        // A path whose interface is physically gone cannot carry real traffic
+        // even if a dev loopback transport lingers, so presence in the scan is
+        // the authority (not transport reachability). Removal is gated by a
+        // grace period so a momentary scan miss does not flap the path.
+        let to_remove: Vec<PathId> = current_paths
+            .iter()
+            .filter(|pid| !candidate_set.contains(pid))
+            .copied()
+            .collect();
+        // Bump the absence counter for every path absent this tick; clear it
+        // for those still present (reappeared) so their grace restarts.
+        for pid in current_paths.iter() {
+            let count = absent_for.entry(*pid).or_insert(0);
+            if to_remove.contains(pid) {
+                *count += 1;
+            } else {
+                *count = 0;
+            }
+        }
+        let remove_now: Vec<PathId> = to_remove
+            .iter()
+            .filter(|pid| absent_for.get(pid).copied().unwrap_or(0) >= RESCAN_GRACE_TICKS)
+            .copied()
+            .collect();
+        for pid in remove_now {
+            tracing::info!(path = pid.get(), "rescan: removing gone path");
+            shared.session.lock().await.remove_path(pid);
+
+            // Abort per-path tasks tracked by the rescan loop.
+            if let Some((r, k, p)) = tracked.remove(&pid) {
+                r.abort();
+                k.abort();
+                p.abort();
+            }
+
+            // Clean up shared state.
+            shared.metrics.lock().await.remove(&pid);
+            shared.path_names.lock().await.remove(&pid);
+            shared.probe_misses.lock().await.remove(&pid);
+            shared.health_changed_at.lock().await.remove(&pid);
+            absent_for.remove(&pid);
+            // Pending probes for this path will be cleaned up by the
+            // reader_loop when it sees the closed transport.
+
+            let session_count = {
+                let sess = shared.session.lock().await;
+                sess.path_count()
+            };
+            counters.lock().await.paths = session_count as u64;
         }
     }
 }
@@ -1065,6 +1411,116 @@ mod tests {
             choose_path(&metrics, &paths, Some(PathId::new(2))),
             Some(PathId::new(3))
         );
+    }
+
+    /// The candidate filter shared with main.rs: strict physical paths first
+    /// (Up + not Virtual + gateway + ifindex), falling back to every Up,
+    /// non-virtual interface when the strict rule drains the list (isolated
+    /// host, spec 7 route suitability).
+    #[test]
+    fn filter_candidates_prefers_physical_then_falls_back() {
+        use sg_network::{Interface, InterfaceKind, InterfaceState};
+
+        let make = |id: &str, state: InterfaceState, kind: InterfaceKind, gateway: bool| Interface {
+            id: id.into(),
+            name: id.into(),
+            ifindex: if gateway { 7 } else { 0 },
+            kind,
+            addresses: Vec::new(),
+            mtu: 1500,
+            state,
+            gateway: gateway.then_some("192.168.1.1".parse().unwrap()),
+            rx_bytes: 0,
+            tx_bytes: 0,
+        };
+
+        // A healthy Wi-Fi with a default gateway and a loopback-free ifindex.
+        let wifi = make(
+            "Wi-Fi",
+            InterfaceState::Up,
+            InterfaceKind::Wifi,
+            true,
+        );
+        // Virtual bridges (Hyper-V/WSL) must be filtered out despite being Up.
+        let bridge = make(
+            "vEthernet (WSL)",
+            InterfaceState::Up,
+            InterfaceKind::Virtual,
+            true,
+        );
+        // A down Ethernet interface must never be selected.
+        let down_eth = make(
+            "Ethernet",
+            InterfaceState::Down,
+            InterfaceKind::Ethernet,
+            true,
+        );
+
+        // Strict filter: only the Wi-Fi qualifies.
+        let strict_input = [bridge.clone(), down_eth.clone(), wifi.clone()];
+        let chosen = filter_candidates(&strict_input);
+        assert_eq!(chosen.len(), 1, "only the physical Up+gated path is chosen");
+        assert_eq!(chosen[0].id, "Wi-Fi");
+
+        // Strict rule drains to nothing (no gateway present) -> fallback to
+        // every Up, non-virtual interface (spec 7).
+        let no_gateway = make("Ethernet", InterfaceState::Up, InterfaceKind::Ethernet, false);
+        let fallback_input = [bridge, no_gateway];
+        let chosen = filter_candidates(&fallback_input);
+        assert_eq!(chosen.len(), 1, "fallback keeps the Up non-virtual path");
+        assert_eq!(chosen[0].id, "Ethernet");
+    }
+
+    /// `record_health` starts the stability clock on first success and grows
+    /// `stability_secs` on subsequent probes while the path stays up; a hard
+    /// failure clears the clock so the next recovery restarts from zero.
+    #[tokio::test]
+    async fn record_health_tracks_stability_seconds() {
+        use std::time::Duration;
+
+        let session = Session::new(sg_session::session_id_from_wire(0x00000001));
+        let shared = Arc::new(Shared {
+            session: tokio::sync::Mutex::new(session),
+            metrics: tokio::sync::Mutex::new(HashMap::new()),
+            path_names: tokio::sync::Mutex::new(HashMap::new()),
+            health_changed_at: tokio::sync::Mutex::new(HashMap::new()),
+            notified: tokio::sync::Mutex::new(None),
+            pending_probes: tokio::sync::Mutex::new(HashMap::new()),
+            probe_misses: tokio::sync::Mutex::new(HashMap::new()),
+            redundancy_loss_threshold: 0.10,
+            scheduler: tokio::sync::Mutex::new(sg_multipath::WeightedBondingScheduler::default()),
+            notified_weights: tokio::sync::Mutex::new(None),
+        });
+        let pid = PathId::new(1);
+
+        // First success: reachable, stable at 0s, clock armed.
+        record_health(&shared, pid, 25).await;
+
+        // Simulate one second passing: stability should tick up.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        record_health(&shared, pid, 25).await;
+        let s = shared.metrics.lock().await;
+        let pm = s.get(&pid).unwrap();
+        assert!(pm.reachable);
+        assert!(pm.stability_secs >= 1, "stability should advance, got {}", pm.stability_secs);
+        drop(s);
+
+        // A hard failure clears the clock; a later recovery restarts at 0.
+        fail_path(shared.clone(), Arc::new(tokio::sync::Mutex::new(Counters::default())), pid, false).await;
+        {
+            let m = shared.metrics.lock().await;
+            assert!(!m.get(&pid).unwrap().reachable, "fail_path marks it unreachable");
+        }
+        // Clock was cleared by fail_path, so the next success restarts from 0.
+        record_health(&shared, pid, 30).await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        record_health(&shared, pid, 30).await;
+        {
+            let m = shared.metrics.lock().await;
+            let pm = m.get(&pid).unwrap();
+            assert!(pm.reachable, "recovered");
+            assert!(pm.stability_secs >= 1, "stability restarts and advances, got {}", pm.stability_secs);
+        }
     }
 
     fn fake_packet(src: [u8; 4], dst: [u8; 4]) -> Vec<u8> {

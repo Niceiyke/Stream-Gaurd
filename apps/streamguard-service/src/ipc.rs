@@ -587,6 +587,8 @@ mod tests {
             redundancy_loss_threshold: 0.0,
             scheduler: Mutex::new(sg_multipath::WeightedBondingScheduler::default()),
             notified_weights: Mutex::new(None),
+            path_names: Mutex::new(HashMap::new()),
+            health_changed_at: Mutex::new(HashMap::new()),
         })
     }
 
