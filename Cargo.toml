@@ -42,6 +42,8 @@ tracing = "0.1"
 tun-rs = "2.8.9"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+# WFP bindings (engineering step 15)
+windows = "0.61.3"
 
 sg-core = { path = "crates/sg-core" }
 sg-protocol = { path = "crates/sg-protocol" }

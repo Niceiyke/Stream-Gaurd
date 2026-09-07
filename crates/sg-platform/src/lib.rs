@@ -15,6 +15,13 @@ use sg_core::error::{Error, Result};
 
 pub mod gateway_net;
 
+/// Selected-app WFP enforcement scaffold (spec 19, spec 28 row 15).
+///
+/// The module is wired unconditionally so the policy types and mock-backed
+/// tests run on any host; the real WFP backend is gated `#[cfg(windows)]`
+/// inside the module.
+pub mod wfp;
+
 /// Named seam for platform-specific construction — this is where the real
 /// adapter creation (Wintun, rtnetlink, utun, NE, VpnService) will live.
 pub trait PlatformAdapter: Send + Sync {

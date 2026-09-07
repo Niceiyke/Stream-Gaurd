@@ -9,3 +9,16 @@ description = "StreamGuard per-OS adapter, socket, route and firewall behavior"
 [dependencies]
 sg-core.workspace = true
 sg-tun.workspace = true
+# Real WFP bindings (engineering step 15) — Windows only.
+# Win32_System_Threading: OpenProcessToken/GetCurrentProcess elevation check
+# (TokenElevation, not CheckTokenMembership — a limited admin token still
+# contains the Administrators group).
+# Win32_System_Rpc: FwpmEngineOpen0's authidentity param is SEC_WINNT_AUTH_IDENTITY_W.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_System_Threading",
+    "Win32_System_Rpc",
+] }
