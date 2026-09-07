@@ -38,7 +38,7 @@ if ($Shell) {
     }
     else {
         Start-Process powershell -WorkingDirectory (Join-Path $root 'desktop') -ArgumentList '-NoExit', '-Command',
-            "cargo tauri dev -- --pipe \\.\pipe\streamguard-status --token `"$ticket`"" | Out-Null
+            "tauri dev -- --pipe \\.\pipe\streamguard-status --token `"$ticket`"" | Out-Null
         "Status shell window opened."
     }
 }
