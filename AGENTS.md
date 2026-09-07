@@ -17,10 +17,10 @@ cargo clippy --workspace --all-targets   # must stay clean
 
 ## Workspace map
 
-- Pure crates in `crates/`: `sg-core` (IDs: `PathId`/`SessionId`/`Sequence`, `Config`), `sg-protocol` (v1 envelope + control msgs), `sg-tun` (`Tun` trait + async-free `LoopbackTun`), `sg-health` (`PathMetrics`), `sg-multipath` (`Sequencer`, `ReorderWindow`, `ReorderBuffer`), `sg-session` (`Session`/`SessionManager`, shared by both ends), `sg-transport` (QUIC via quinn; **`quic` feature is off by default** — new consumers must add `features = ["quic"]`), `sg-auth`, `sg-routing`, `sg-network`, `sg-platform`.
-- `apps/streamguard-service` = client engine: `client::start(Tun, ClientOptions, session_id, &[PathId], token)` spawns per-path reader/keepalive/probe loops + uplink loop. `main.rs` owns real TUN setup.
+- Pure crates in `crates/`: `sg-core` (IDs: `PathId`/`SessionId`/`Sequence`, `Config`), `sg-protocol` (v1 envelope + control msgs), `sg-tun` (`Tun` trait + async-free `LoopbackTun`), `sg-health` (`PathMetrics`), `sg-multipath` (`Sequencer`, `ReorderWindow`, `ReorderBuffer`), `sg-session` (`Session`/`SessionManager`, shared by both ends), `sg-transport` (QUIC via quinn; **`quic` feature is off by default** — new consumers must add `features = ["quic"]`), `sg-auth`, `sg-routing`, `sg-network`, `sg-platform` (WFP selected-app scaffold in `wfp.rs`), `sg-wordlyte` (consumer status SDK over the IPC plane).
+- `apps/streamguard-service` = client engine: `client::start(Tun, ClientOptions, session_id, &[PathId], token, status: Option<StatusEndpoint>)` spawns per-path reader/keepalive/probe loops + uplink loop; also the status plane (`status.rs` `StatusProvider`/`StatusSnapshot`, `ipc.rs` authenticated named-pipe/TCP server, `StatusClient`). `main.rs` owns real TUN setup.
 - `apps/streamguard-gateway` = gateway: `tunnel::start(host_tun, GatewayQuic, secret)` runs one uplink reader per accepted connection + a downlink loop with a reverse flow table.
-- `desktop/` is an empty placeholder (`.gitkeep` only) — no Tauri yet.
+- `desktop/src-tauri` = non-workspace Tauri v2 status shell (step 12): own Cargo.lock, `frontendDist ../ui`, consumes the engine's status IPC via `StatusClient`; excluded from root gates by design.
 
 ## Wire / protocol gotchas
 
@@ -44,4 +44,4 @@ cargo clippy --workspace --all-targets   # must stay clean
 
 ## Milestone status
 
-Engineering sequence is spec §28. Committed so far: steps up to 13 (probes `8b88eaf`, active/standby failover `1073978`, adaptive duplication `9086e0f`, reorder buffer `bb2d06e`). Step 14 = weighted scheduling/bonding is the next engine milestone. Steps 11 (live egress unplug test), 12 (Tauri UI), 15 (WFP), 16 (Wordlyte) need real hardware/platform work.
+Engineering sequence is spec §28. Committed so far: steps 1-10 plus 12-16 — probes `8b88eaf`, active/standby failover `1073978`, adaptive duplication `9086e0f`, reorder buffer `bb2d06e`, weighted scheduling/bonding (step 14) `1b6515b` + downlink mirror `c290df8`, status plane (step 12 T1) `6b3cea7` + Tauri shell (step 12 T2) `4130da4`, WFP selected-app scaffold (step 15) `d99b29a`, Wordlyte SDK (step 16) `da0ae3c` + `StatusProvider::from_snapshot_fn` seam `c3418ed`. Remaining: step 11 (live egress unplug test, spec §27 — needs two real NICs and admin; only the scaffold/harness can be done here). Real-platform verification still outstanding: WFP ALE filters need an elevated run with real app paths; the Tauri/Wordlyte UI needs the engine service publishing the pipe in production.

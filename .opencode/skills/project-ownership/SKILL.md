@@ -11,8 +11,8 @@ description: StreamGuard product ownership — ground decisions in prd.md, spec(
 - `git log --oneline -15` — committed milestone history.
 
 ## Current state (verify before relying on it)
-- Engineering sequence is spec §28 (16 steps). Committed so far: steps through 13, i.e. probes `8b88eaf`, active/standby failover `1073978`, adaptive duplication `9086e0f`, reorder buffer `bb2d06e`.
-- Remaining: step 14 weighted scheduling/bonding (next engine milestone), step 11 live egress unplug test (needs real NICs), step 12 Tauri UI, step 15 WFP, step 16 Wordlyte.
+- Engineering sequence is spec §28 (16 steps). Committed steps 1-10 and 12-16 (see AGENTS.md "Milestone status" for hashes). Remaining: step 11 live egress unplug test (spec §27 — needs two real NICs and admin).
+- Real-platform verification still pending on this host: WFP ALE filters (needs elevated run + real app paths), Tauri/Wordlyte UI against the production pipe, and hardware failover.
 - Always re-verify status by reading AGENTS.md + git log; do not recite it from memory.
 
 ## Decision principles
