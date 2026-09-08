@@ -1,0 +1,164 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_VERSION: 1.85.0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  engine-linux:
+    name: Engine (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install $RUST_VERSION --profile minimal --component clippy
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Check workspace
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/streamguard-ci"
+          cargo +$RUST_VERSION check --workspace --all-targets --locked 2>&1 | tee "$RUNNER_TEMP/streamguard-ci/engine-check.log"
+
+      - name: Test workspace
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +$RUST_VERSION test --workspace --locked 2>&1 | tee "$RUNNER_TEMP/streamguard-ci/engine-test.log"
+
+      - name: Lint workspace
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +$RUST_VERSION clippy --workspace --all-targets --locked -- -D warnings 2>&1 | tee "$RUNNER_TEMP/streamguard-ci/engine-clippy.log"
+
+      - name: Upload engine logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: engine-linux-logs
+          path: |
+            ${{ runner.temp }}/streamguard-ci/engine-check.log
+            ${{ runner.temp }}/streamguard-ci/engine-test.log
+            ${{ runner.temp }}/streamguard-ci/engine-clippy.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  engine-windows:
+    name: Engine (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        shell: pwsh
+        run: rustup toolchain install $env:RUST_VERSION --profile minimal
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+          key: cargo-${{ runner.os }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Check Windows workspace
+        shell: pwsh
+        run: |
+          $logDir = Join-Path $env:RUNNER_TEMP "streamguard-ci"
+          New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+          cargo +$env:RUST_VERSION check --workspace --all-targets --locked 2>&1 | Tee-Object -FilePath (Join-Path $logDir "engine-check.log")
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload Windows engine logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: engine-windows-logs
+          path: ${{ runner.temp }}\streamguard-ci\engine-check.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  desktop-windows:
+    name: Desktop (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        shell: pwsh
+        run: rustup toolchain install $env:RUST_VERSION --profile minimal
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+          key: cargo-desktop-${{ runner.os }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'desktop/src-tauri/Cargo.lock') }}
+
+      - name: Check desktop shell
+        shell: pwsh
+        run: |
+          $logDir = Join-Path $env:RUNNER_TEMP "streamguard-ci"
+          New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+          cargo +$env:RUST_VERSION check --manifest-path desktop/src-tauri/Cargo.toml --all-targets --locked 2>&1 | Tee-Object -FilePath (Join-Path $logDir "desktop-check.log")
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test desktop shell
+        shell: pwsh
+        run: |
+          $logDir = Join-Path $env:RUNNER_TEMP "streamguard-ci"
+          cargo +$env:RUST_VERSION test --manifest-path desktop/src-tauri/Cargo.toml --locked 2>&1 | Tee-Object -FilePath (Join-Path $logDir "desktop-test.log")
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build desktop shell
+        shell: pwsh
+        run: |
+          $logDir = Join-Path $env:RUNNER_TEMP "streamguard-ci"
+          # The V1 frontend is static; the Rust build runs build.rs, which
+          # validates tauri.conf.json and generates its asset context.
+          cargo +$env:RUST_VERSION build --manifest-path desktop/src-tauri/Cargo.toml --locked 2>&1 | Tee-Object -FilePath (Join-Path $logDir "desktop-build.log")
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload desktop logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: desktop-windows-logs
+          path: |
+            ${{ runner.temp }}\streamguard-ci\desktop-check.log
+            ${{ runner.temp }}\streamguard-ci\desktop-test.log
+            ${{ runner.temp }}\streamguard-ci\desktop-build.log
+          if-no-files-found: ignore
+          retention-days: 7
