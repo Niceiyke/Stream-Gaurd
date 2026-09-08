@@ -33,7 +33,9 @@ async-trait = "0.1"
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-socket2 = "0.5"
+# `all` exposes platform-specific interface-binding helpers used by the
+# per-NIC QUIC path implementation on Linux.
+socket2 = { version = "0.5", features = ["all"] }
 thiserror = "2"
 quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio", "log"] }
 rcgen = "0.13"
