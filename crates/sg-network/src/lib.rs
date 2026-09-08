@@ -341,6 +341,8 @@ mod linux_scanner {
         let mut out = Vec::with_capacity(groups.len());
         for (name, addresses, index) in groups {
             let sys = format!("/sys/class/net/{name}");
+            let kind = kind_of_name(&name);
+            let gateway = read_gateway(&name);
             let state = match fs::read_to_string(format!("{sys}/operstate")).ok().as_deref() {
                 Some("up") => InterfaceState::Up,
                 Some("dormant") => InterfaceState::Dormant,
@@ -356,11 +358,11 @@ mod linux_scanner {
                 id: name.clone(),
                 name,
                 ifindex: index.unwrap_or(0) as u32,
-                kind: kind_of_name(&name),
+                kind,
                 addresses,
                 mtu: read_u64(&format!("{sys}/mtu")) as u32,
                 state,
-                gateway: read_gateway(&name),
+                gateway,
                 rx_bytes: read_u64(&format!("{sys}/statistics/rx_bytes")),
                 tx_bytes: read_u64(&format!("{sys}/statistics/tx_bytes")),
             });
