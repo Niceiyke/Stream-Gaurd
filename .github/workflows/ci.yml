@@ -62,7 +62,7 @@ jobs:
         run: |
           set -o pipefail
           rustup toolchain install nightly --profile minimal 2>&1 | tee "$RUNNER_TEMP/streamguard-ci/v2-fuzz.log"
-          cargo +nightly install cargo-fuzz --version 0.12.0 --locked 2>&1 | tee -a "$RUNNER_TEMP/streamguard-ci/v2-fuzz.log"
+          cargo +nightly install cargo-fuzz --version 0.13.2 --locked 2>&1 | tee -a "$RUNNER_TEMP/streamguard-ci/v2-fuzz.log"
           cargo +nightly fuzz run --sanitizer address v2_decode -- -runs=1000 2>&1 | tee -a "$RUNNER_TEMP/streamguard-ci/v2-fuzz.log"
 
       - name: Upload engine logs on failure
