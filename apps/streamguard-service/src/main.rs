@@ -22,6 +22,11 @@
 //! - `STREAMGUARD_TUN_ADDR`     IPv4 address for this host's TUN adapter
 //!   (default 10.0.85.1; the real launcher assigns the client 10.0.85.2 so
 //!   one host can ride gateway + client without an address clash).
+//! - `STREAMGUARD_TUN_NAME`      Wintun adapter name (Windows default
+//!   `streamguard`). A Wintun adapter name is a persistent per-session
+//!   identity: when gateway + client ride the same host they MUST use
+//!   distinct names, or the second create fails with
+//!   ERROR_ALREADY_INITIALIZED.
 //! - `WINTUN_DLL`               optional path override passed to tun-rs
 //!   (Windows only; otherwise `wintun.dll` is loaded from the working dir).
 //! - `STREAMGUARD_PIPE`        status-server named pipe (Windows; default
@@ -201,6 +206,8 @@ async fn main() -> anyhow::Result<()> {
     // `STREAMGUARD_TUN_ADDR` lets the real launcher give the client side of
     // the tunnel its own address on the gateway subnet (spec 26.5).
     let tun_cfg = TunConfig {
+        name: std::env::var("STREAMGUARD_TUN_NAME")
+            .unwrap_or_else(|_| String::from("streamguard")),
         address: std::env::var("STREAMGUARD_TUN_ADDR")
             .unwrap_or_else(|_| String::from("10.0.85.1")),
         ..TunConfig::default()

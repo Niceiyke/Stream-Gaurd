@@ -104,35 +104,51 @@ if (-not $NoFirewall) {
 
 "Gateway address: $GatewayAddr  (same-host real test; real uplink kbps needs a remote gateway)"
 
-# Shared env prefix - NOTE there is deliberately NO STREAMGUARD_DEV here.
-$envPrefix = "`$env:STREAMGUARD_SECRET='$secret'; `$env:STREAMGUARD_CERT_DIR='$certDir'; " +
+# Shared env prefix - NOTE there is deliberately NO STREAMGUARD_DEV here; it
+# is explicitly cleared in case the launching shell inherited it (a stale dev
+# var would silently turn this into a loopback simulation).
+$envPrefix = "Remove-Item Env:STREAMGUARD_DEV -ErrorAction SilentlyContinue; " +
+             "`$env:STREAMGUARD_SECRET='$secret'; `$env:STREAMGUARD_CERT_DIR='$certDir'; " +
              "`$env:STREAMGUARD_TUN_ADDR='10.0.85.1'; `$env:STREAMGUARD_PRINT_TICKET='1'; " +
              "`$env:WINTUN_DLL='$wintunDll'; `$env:RUST_LOG='info'; "
 
+# Run the exes built above directly (not `cargo run`, which would rebuild with
+# DEFAULT features and silently run the dev/loopback binary). These windows
+# keep the native-tun build already in target\debug.
+$gwExe = Join-Path $root 'target\debug\streamguard-gateway.exe'
+$svcExe = Join-Path $root 'target\debug\streamguard-service.exe'
+
 # Terminal 1 - gateway (first: mints sgcerts/cert.der + key.der on first run).
-$gateCmd = "$envPrefix cargo run -p streamguard-gateway"
+$gateCmd = "$envPrefix & '$gwExe'"
 Start-Process powershell -WorkingDirectory $root -ArgumentList '-NoExit', '-Command', $gateCmd | Out-Null
 "Gateway window opened - waiting for it to mint certs... "
 Start-Sleep -Seconds 10
 
 # Terminal 2 - service: dials the gateway over the real NIC, its own TUN side.
+# Drop any stale ticket first so -Shell below can't pick up a previous session.
+$tf = Join-Path $env:TEMP 'streamguard-dev-ticket.txt'
+Remove-Item -LiteralPath $tf -Force -ErrorAction SilentlyContinue
 $svcCmd = "$envPrefix `$env:STREAMGUARD_TUN_ADDR='10.0.85.2'; " +
-          "`$env:STREAMGUARD_ADDR='$GatewayAddr'; cargo run -p streamguard-service"
+          "`$env:STREAMGUARD_TUN_NAME='streamguard-client'; " +
+          "`$env:STREAMGUARD_ADDR='$GatewayAddr'; & '$svcExe'"
 Start-Process powershell -WorkingDirectory $root -ArgumentList '-NoExit', '-Command', $svcCmd | Out-Null
 "Service window opened (bound paths, real TUN, real kbps)."
 
 # Terminal 3 - optional status shell (reads the TEMP ticket the service drops
 # because STREAMGUARD_PRINT_TICKET=1; identical to run-dev.ps1 -Shell).
 if ($Shell) {
-    $tf = Join-Path $env:TEMP 'streamguard-dev-ticket.txt'
     $ticket = ''; $prefix = ''
-    if ((Test-Path -LiteralPath $tf) -and -not [string]::IsNullOrWhiteSpace($Token)) {
+    if (-not [string]::IsNullOrWhiteSpace($Token)) {
         $ticket = $Token
     }
-    elseif (Test-Path -LiteralPath $tf) {
-        $parts = @((Get-Content -LiteralPath $tf -Raw) -split "`r?`n")
-        $ticket = $parts[0].Trim()
-        $prefix = $parts[1].Trim()
+    else {
+        # Wait (bounded) for the fresh service to write its ticket.
+        for ($i = 0; $i -lt 40 -and -not (Test-Path -LiteralPath $tf); $i++) { Start-Sleep -Milliseconds 500 }
+        if (Test-Path -LiteralPath $tf) {
+            $parts = @((Get-Content -LiteralPath $tf -Raw) -split "`r?`n")
+            $ticket = $parts[0].Trim()
+            $prefix = $parts[1].Trim()
+        }
     }
     if ([string]::IsNullOrWhiteSpace($ticket)) {
         "Shell requested but no ticket found - start the service first, then re-run with -Shell."

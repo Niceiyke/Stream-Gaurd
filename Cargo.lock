@@ -1040,6 +1040,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "if-addrs",
  "quinn",
  "rcgen",
  "ring",
@@ -1060,6 +1061,8 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]

@@ -230,10 +230,40 @@ async fn serve_named_pipe(
     use tokio::net::windows::named_pipe::ServerOptions;
 
     fn new_instance(name: &str) -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
-        ServerOptions::new()
-            .access_inbound(true)
-            .access_outbound(true)
-            .create(name)
+        use windows::Win32::Security::{
+            InitializeSecurityDescriptor, MakeSelfRelativeSD, PSECURITY_DESCRIPTOR,
+            SECURITY_ATTRIBUTES, SetSecurityDescriptorDacl,
+        };
+
+        // An elevated service otherwise mints the pipe with the default DACL,
+        // whose admin-only grants the non-elevated status shell no access
+        // ("Access is denied"). Give CreateNamedPipeW a NULL-DACL descriptor
+        // instead: any local process can open the pipe, and the HMAC
+        // bootstrap-ticket challenge still gates every connection (spec 12
+        // status plane) — the DACL is not the auth boundary.
+        let mut sd_buf = [0u8; 128];
+        let sd = PSECURITY_DESCRIPTOR(sd_buf.as_mut_ptr().cast());
+        unsafe {
+            // SECURITY_DESCRIPTOR_REVISION == 1.
+            InitializeSecurityDescriptor(sd, 1)?;
+            SetSecurityDescriptorDacl(sd, true, None, false)?;
+            // CreateNamedPipeW wants a self-relative descriptor; MakeSelf- 
+            // RelativeSD reports the needed size first (expected to fail with
+            // ERROR_INSUFFICIENT_BUFFER on the sizing call).
+            let mut len = 0u32;
+            let _ = MakeSelfRelativeSD(sd, None, &mut len);
+            let mut rel = vec![0u8; len.max(128) as usize];
+            MakeSelfRelativeSD(sd, Some(PSECURITY_DESCRIPTOR(rel.as_mut_ptr().cast())), &mut len)?;
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: rel.as_mut_ptr().cast::<core::ffi::c_void>(),
+                bInheritHandle: windows_core::BOOL(0),
+            };
+            ServerOptions::new()
+                .access_inbound(true)
+                .access_outbound(true)
+                .create_with_security_attributes_raw(name, &sa as *const _ as *mut _)
+        }
     }
 
     let mut pending = match new_instance(&name) {

@@ -47,6 +47,24 @@ use sg_tun::Tun;
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 
+/// True when the on-path dial target is an address this host answers for
+/// (loopback or any local interface address). Per-NIC unicast binding to a
+/// self destination is meaningless, and on Windows an `IP_UNICAST_IF`-bound
+/// socket cannot deliver to the host's own IP at all (the same-host launcher
+/// dials the LAN IP — see run-real.ps1), so those paths ride the plain
+/// unbound socket instead and report `bound=false`.
+fn dial_target_is_local(addr: std::net::SocketAddr) -> bool {
+    if addr.ip().is_loopback() {
+        return true;
+    }
+    if addr.ip().is_unspecified() {
+        return false;
+    }
+    if_addrs::get_if_addrs()
+        .map(|addrs| addrs.iter().any(|entry| entry.ip() == addr.ip()))
+        .unwrap_or(false)
+}
+
 /// Shared bundle of state every task needs.
 pub(crate) struct Shared {
     pub(crate) session: Mutex<Session>,
@@ -264,7 +282,11 @@ pub async fn start<T: Tun + Send + 'static>(
     // Open and bind one transport per path, in the given order. The first
     // bound path becomes the initial active path; health re-ranks later.
     for (index, path_id) in paths.iter().copied().enumerate() {
-        let interface = options.path_interfaces.get(index).copied().flatten();
+        let interface = if dial_target_is_local(options.addr) {
+            None
+        } else {
+            options.path_interfaces.get(index).copied().flatten()
+        };
         let path = connect_path_on_interface(
             options.addr,
             &options.server_name,
@@ -1004,7 +1026,7 @@ async fn rescan_loop<T: Tun + Send + 'static>(
                 path = pid.get(),
                 "rescan: adding new path"
             );
-            let ifindex = if dev_binding_free {
+            let ifindex = if dev_binding_free || dial_target_is_local(addr) {
                 None
             } else {
                 (iface.ifindex != 0).then_some(iface.ifindex)

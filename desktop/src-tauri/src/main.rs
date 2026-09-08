@@ -185,16 +185,18 @@ fn make_endpoint(_pipe: Option<String>, port: Option<u16>) -> Option<(StatusEndp
     None
 }
 
-/// Parse a `u32` from decimal or hexadecimal (an optional `0x` prefix is
-/// tolerated). The session prefix is the 4-byte wire id, naturally displayed
-/// in hex.
+/// Parse a `u32` from decimal or hexadecimal. An explicit `0x`/`0X` prefix
+/// forces hex; otherwise decimal is tried first and hex is the fallback (the
+/// engine emits bare 8-hex-digit prefixes, e.g. `346100b7`).
 fn parse_hex_u32(s: &str) -> Option<u32> {
     let s = s.trim();
-    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        u32::from_str_radix(hex, 16).ok()
+    let parsed = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16)
     } else {
-        s.parse::<u32>().ok()
-    }
+        s.parse::<u32>()
+            .or_else(|_| u32::from_str_radix(s, 16))
+    };
+    parsed.ok()
 }
 
 fn main() {
