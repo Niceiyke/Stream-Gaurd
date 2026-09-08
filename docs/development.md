@@ -41,7 +41,8 @@ the V1 shell is production-ready.
 ## CI And Dependency Policy
 
 - CI runs root engine check, test, and clippy in order on Linux, plus a Windows
-  compile check and a separate Windows desktop job.
+  compile check and a separate Windows desktop job. Linux CI also runs the V2
+  decoder fuzz corpus under AddressSanitizer with a bounded iteration count.
 - CI caches only Cargo registry and Git dependency directories. It never caches
   `target`, credentials, generated certificates, diagnostics, packet captures,
   or deployment state.

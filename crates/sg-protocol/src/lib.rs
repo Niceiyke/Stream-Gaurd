@@ -6,6 +6,7 @@
 //! reorder packets that arrive over independent physical paths.
 
 pub mod control;
+pub mod v2;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};

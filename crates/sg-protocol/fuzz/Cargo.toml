@@ -1,0 +1,22 @@
+[package]
+name = "sg-protocol-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1"
+libfuzzer-sys = "0.4"
+sg-protocol = { path = ".." }
+
+[[bin]]
+name = "v2_decode"
+path = "fuzz_targets/v2_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

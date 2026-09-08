@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod error;
 pub mod path_registry;
+pub mod v2;
 
 /// Identifies a StreamGuard device (one desktop/mobile install).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

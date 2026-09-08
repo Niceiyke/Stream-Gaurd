@@ -56,6 +56,15 @@ jobs:
           set -o pipefail
           cargo +$RUST_VERSION clippy --workspace --all-targets --locked -- -D warnings 2>&1 | tee "$RUNNER_TEMP/streamguard-ci/engine-clippy.log"
 
+      - name: Fuzz V2 decoder corpus with AddressSanitizer
+        shell: bash
+        working-directory: crates/sg-protocol/fuzz
+        run: |
+          set -o pipefail
+          rustup toolchain install nightly --profile minimal 2>&1 | tee "$RUNNER_TEMP/streamguard-ci/v2-fuzz.log"
+          cargo +nightly install cargo-fuzz --version 0.12.0 --locked 2>&1 | tee -a "$RUNNER_TEMP/streamguard-ci/v2-fuzz.log"
+          cargo +nightly fuzz run --sanitizer address v2_decode -- -runs=1000 2>&1 | tee -a "$RUNNER_TEMP/streamguard-ci/v2-fuzz.log"
+
       - name: Upload engine logs on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -65,6 +74,7 @@ jobs:
             ${{ runner.temp }}/streamguard-ci/engine-check.log
             ${{ runner.temp }}/streamguard-ci/engine-test.log
             ${{ runner.temp }}/streamguard-ci/engine-clippy.log
+            ${{ runner.temp }}/streamguard-ci/v2-fuzz.log
           if-no-files-found: ignore
           retention-days: 7
 

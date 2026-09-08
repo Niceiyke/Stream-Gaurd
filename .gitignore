@@ -1,4 +1,5 @@
 /target
+/crates/sg-protocol/fuzz/target/
 **/*.rs.bk
 .idea/
 .vscode/
