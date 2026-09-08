@@ -357,7 +357,7 @@ mod linux_scanner {
             out.push(Interface {
                 id: name.clone(),
                 name,
-                ifindex: index.unwrap_or(0) as u32,
+                ifindex: index.unwrap_or(0),
                 kind,
                 addresses,
                 mtu: read_u64(&format!("{sys}/mtu")) as u32,
