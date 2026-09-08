@@ -1,6 +1,8 @@
 //! V2 datagram framing. Admission and state changes use a reliable control
 //! stream; V2 datagrams carry non-control payload only.
 
+pub mod control;
+
 use bytes::{Bytes, BytesMut};
 use sg_core::v2::{FlowId, PacketId, PathId, SessionId, TrafficClass};
 use std::fmt;

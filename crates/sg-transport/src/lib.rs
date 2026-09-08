@@ -6,6 +6,10 @@
 //! tunnel milestone; this crate currently defines the seam that must stay
 //! behind `sg-transport` so the scheduler never touches UDP directly.
 
+/// V2 reliable-control framing over a caller-provided byte stream. This seam
+/// deliberately does not create or open Quinn streams; WP-600 owns that work.
+pub mod v2;
+
 use sg_core::{error::Result, PathId, SessionId};
 use sg_protocol::Envelope;
 

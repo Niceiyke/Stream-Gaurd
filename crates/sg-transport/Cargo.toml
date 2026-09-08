@@ -23,6 +23,7 @@ sg-protocol.workspace = true
 socket2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+thiserror.workspace = true
 
 # WinSock-based per-NIC unicast binding (interface index via IP_UNICAST_IF).
 # The `IP_UNICAST_IF` socket option is Windows-only; socket2 0.5 does not
