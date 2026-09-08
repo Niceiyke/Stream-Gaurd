@@ -11,7 +11,17 @@ Desktop.ini
 *.pem
 *.crt
 *.key
+*.der
 !testdata/**/*.pem
+
+# V1 local development credentials and runtime state. V2 production keys use
+# platform/operator-managed stores and must never live in the worktree.
+/sgcerts/
+/streamguard-state/
+/diagnostics/
+/packet-captures/
+*.ticket
+*.diag
 
 # Third-party runtime DLLs/archives (Wintun, etc.) — never commit binaries.
 wintun-*.zip

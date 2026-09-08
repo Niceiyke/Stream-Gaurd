@@ -1,4 +1,4 @@
-# StreamGuard Desktop (Tauri v2 status shell)
+# StreamGuard Desktop (V1 Tauri status shell)
 
 Thin-client status UI for the StreamGuard privileged engine service (spec
 §22 "Desktop Service", engineering step 12 "Desktop status UI"). The engine
@@ -55,10 +55,10 @@ in a "service not connected" state — it never panics.
 > HMAC-SHA256 challenge-response handshake (`streamguard_service::ipc`).
 > Only the destination's shape is logged — the token itself is never printed.
 
-## Production
+## V1 Development Status
 
-The privileged **engine service** (spec §22) is what actually publishes the
-named pipe and runs the status IPC server (`spawn_status_server`) in
-production. This desktop shell is a separate user-facing process that
-connects to that pipe. Bundling/installing the engine as a Windows service
-is out of scope for the engineering-step-12 gate.
+This V1 shell is a development-only status viewer. Its status token is not a
+V2 gateway credential and its IPC contract is not the V2 local-agent API.
+Bundling/installing the engine as a Windows service is out of scope for this
+prototype. The V2 desktop/operator console and secure local API are defined by
+`REBUILD_V2_AGENT_PLAN.md` WP-700 and WP-701.

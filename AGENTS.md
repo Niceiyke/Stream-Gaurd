@@ -2,6 +2,16 @@
 
 StreamGuard: resilient client→gateway multipath tunnel in Rust. No README; `spec(6).md` is the authoritative engineering spec (code comments cite section numbers, e.g. "spec 11.2"), `prd.md` is the product doc.
 
+## V1 status
+
+The current client, gateway, desktop shell, and wire protocol are V1
+development/experimental scaffolding. They are not approved for Internet
+deployment, customer traffic, or live production. V1 uses unsafe production
+contracts including a shared secret, client-minted ticket, four-byte wire
+session identity, datagram control, and session-global reorder queue. Build
+new production behavior only under `REBUILD_V2_AGENT_PLAN.md`; V1 remains only
+for development tests until the V2 cutover policy is satisfied.
+
 ## Commands
 
 ```powershell
@@ -42,9 +52,12 @@ cargo clippy --workspace --all-targets   # must stay clean
 - Assertions read counters: `handle.counters().await.frames_to_host`, `duplicates_dropped`, `sessions`, `keepalives`, `probes_replied`, plus client-side `probes_sent`/`soft_failures`/`duplicates_sent`.
 - `.gitattributes` forces LF for `.rs` (git may warn "LF will be replaced by CRLF" on `Cargo.lock` — harmless). `wintun-*.zip` is a gitignored build artifact; never commit binaries/DLLs.
 
-### Running locally
+### Running V1 locally (development only)
 
-Two terminals on one host (both read the same env values — the secret **must match**, that is the whole auth contract, spec 22):
+These commands exercise V1 development scaffolding only. The shared secret,
+self-signed certificate, locally minted ticket, and generated `sgcerts/`
+material are prohibited production credentials. Both terminals read the same
+secret because that is the V1 development-only authentication contract:
 
 | Terminal | Command |
 | --- | --- |
