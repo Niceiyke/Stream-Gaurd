@@ -3,11 +3,10 @@ name = "streamguard-desktop"
 version = "0.1.0"
 edition = "2021"
 # The desktop shell is a standalone (non-workspace) crate (spec 22 / step 12).
-# rust-version is the max of the engine's MSRV (the `streamguard-service` path
-# dep inherits 1.85 from the root workspace) and Tauri 2.x's own MSRV (1.77),
-# so 1.85 is the effective floor. Bumping the engine MSRV below is the only
-# way this must move.
-rust-version = "1.85"
+# The engine path dependency supports Rust 1.85, but Tauri 2.11 transitively
+# requires `time` with an MSRV of Rust 1.88. The standalone desktop shell uses
+# that higher toolchain without changing the engine workspace MSRV.
+rust-version = "1.88"
 license = "MIT"
 description = "StreamGuard Tauri v2 desktop status shell (engineering step 12)"
 

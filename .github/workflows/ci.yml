@@ -119,6 +119,10 @@ jobs:
   desktop-windows:
     name: Desktop (Windows)
     runs-on: windows-latest
+    env:
+      # Tauri 2.11 transitively requires time >=0.3.47, whose MSRV is 1.88.
+      # The root engine remains validated at the workspace MSRV (1.85.0).
+      RUST_VERSION: 1.88.0
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

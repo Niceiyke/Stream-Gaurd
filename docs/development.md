@@ -2,10 +2,11 @@
 
 ## Supported Toolchain
 
-StreamGuard's current MSRV is Rust 1.85, edition 2021. CI installs Rust
-1.85.0 explicitly and uses `--locked` for both lockfiles. Updating the MSRV,
-toolchain, lockfiles, or a major dependency is an approved work packet, not
-incidental feature work.
+The engine workspace MSRV is Rust 1.85, edition 2021. CI installs Rust 1.85.0
+for engine validation and Rust 1.88.0 for the standalone Tauri desktop shell,
+whose Tauri 2.11 dependency graph requires it. Both use `--locked` lockfiles.
+Updating these toolchain requirements, lockfiles, or a major dependency is an
+approved work packet, not incidental feature work.
 
 The root workspace validates the Rust engine. The Tauri desktop shell keeps a
 separate lockfile and is validated by its own Windows CI job.
