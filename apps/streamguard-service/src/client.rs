@@ -142,6 +142,7 @@ pub struct ClientHandle<T: Tun + Send + 'static> {
     run: Option<JoinHandle<()>>,
     shutdown: Option<oneshot::Sender<()>>,
     shared: Arc<Shared>,
+    status_endpoint: Option<crate::ipc::StatusEndpoint>,
     /// Exposed so tests can `enqueue` replies into the TUN and
     /// `drain_outbound` to assert that decrypted downlink packets arrived.
     pub tun: Arc<Mutex<T>>,
@@ -161,6 +162,11 @@ impl<T: Tun + Send + 'static> ClientHandle<T> {
 
     pub async fn counters(&self) -> Counters {
         self.counters.lock().await.clone()
+    }
+
+    /// The concrete status endpoint after the listener resolves a TCP port.
+    pub fn status_endpoint(&self) -> Option<&crate::ipc::StatusEndpoint> {
+        self.status_endpoint.as_ref()
     }
 
     /// Updates the friendly interface names shown in the status dashboard.
@@ -368,16 +374,16 @@ pub async fn start<T: Tun + Send + 'static>(
     // server answers `StatusSnapshot` requests from the UI. Spawned before
     // the run loop so its accept loop is already pending when the run loop
     // starts; aborted with the engine on shutdown.
-    let status_task = match status {
+    let (status_endpoint, status_task) = match status {
         Some(endpoint) => {
             let provider =
                 crate::status::StatusProvider::new(shared.clone(), counters.clone());
             let handle =
                 crate::ipc::spawn_status_server(endpoint, provider, token, counters.clone())
                     .await?;
-            Some(handle.task)
+            (Some(handle.endpoint().clone()), Some(handle.task))
         }
-        None => None,
+        None => (None, None),
     };
 
     // Live rescan loop (spec 31.5): re-enumerates interfaces every 5s and
@@ -415,6 +421,7 @@ pub async fn start<T: Tun + Send + 'static>(
         run: Some(run),
         shutdown: Some(shutdown_tx),
         shared,
+        status_endpoint,
         tun,
         counters,
     })

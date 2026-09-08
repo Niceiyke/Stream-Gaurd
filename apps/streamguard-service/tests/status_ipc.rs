@@ -26,7 +26,7 @@ use tokio::time::{Duration, sleep};
 
 /// The status plane rides the platform-native loopback transport: the named
 /// pipe on Windows (where the privileged service runs), TCP on other hosts.
-fn status_endpoint(tag: &str) -> StatusEndpoint {
+fn status_endpoint(_tag: &str) -> StatusEndpoint {
     #[cfg(windows)]
     {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,7 +35,7 @@ fn status_endpoint(tag: &str) -> StatusEndpoint {
             .unwrap()
             .as_nanos();
         StatusEndpoint::NamedPipe(format!(
-            r"\\.\pipe\streamguard-status-{tag}-{}-{nanos}",
+            r"\\.\pipe\streamguard-status-{_tag}-{}-{nanos}",
             std::process::id()
         ))
     }
@@ -156,6 +156,10 @@ impl Fixture {
         )
         .await
         .expect("engine starts with the status plane");
+        let endpoint = client
+            .status_endpoint()
+            .cloned()
+            .expect("engine exposes the resolved status endpoint");
 
         // Prove the plumbing is live before returning: one snapshot over the
         // real endpoint, projected from the running engine.
