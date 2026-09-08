@@ -1,22 +1,43 @@
 ---
-description: Wire-format and in-order reassembly rules for StreamGuard. Load before editing envelope/protocol/session/reorder code (sg-protocol, sg-session, sg-multipath, tunnel.rs, client.rs) or any echo/data integration test.
+name: streamguard-wire
+description: StreamGuard V1/V2 wire and packet-delivery guardrails. Load before editing protocol, QUIC control, session, dedup, reorder, tunnel, or packet integration tests.
 ---
 
-# StreamGuard wire & reassembly rules
+# StreamGuard Wire Guardrails
 
-## Envelope (spec 11.1)
-- Envelope is a 20-byte fixed header inside each QUIC datagram.
-- `Sequence` is `u64` in code but **48-bit (6 bytes) on the wire**: values ≥ 2^48 truncate silently across encode/decode. Keep test sequences small.
-- Only the **first 4 bytes** of `SessionId` cross the wire; decode zero-fills the tail. For any id that travels, build it with `sg_session::session_id_from_wire(prefix)`. `SessionId::new()` is only safe locally.
-- `PacketType`: Data=0, Duplicate=1, Control=2, Probe=3, Keepalive=4, PathStatus=5. `Duplicate` carries an already-seen sequence (redundancy); first-valid-wins.
+## V2 requirements
 
-## In-order reassembly (spec 11.2)
-- Active model: both the gateway reader and client downlink reader call `Session::enqueue_incoming(seq, payload) -> sg_multipath::ReorderOutcome` and write every `outcome.delivered` payload to the TUN; `outcome.dropped` increments `duplicates_dropped`.
-- `next_expected` starts at **0**. A first packet with seq ≠ 0 is buffered forever — echo/data tests MUST start at `Sequence::new(0)`.
-- Echo gateways bounce the SAME sequence back. Do NOT reintroduce the old `+1_000_000` echo offset — it silently buffers.
-- `ReorderBuffer` dedups via `ReorderWindow` (first-valid-wins), uses `BTreeMap<u64, Bytes>` for the wait buffer, drops far-ahead packets when `seq.saturating_sub(next_expected) > capacity`, and drops-when-full without evicting.
+- Treat `REBUILD_V2_AGENT_PLAN.md` WP-100, WP-101, WP-301, and WP-302 as the
+  implementation contract.
+- V2 session IDs are full-width, opaque, and server-issued. Never truncate or
+  reconstruct an ID from a prefix.
+- Validate version, flags, enums, framing, and payload size before state
+  allocation. All attacker-controlled collections have an explicit bound.
+- QUIC datagrams carry payload only. Authentication, admission, attach/detach,
+  policy, and path state use a reliable framed control stream with request IDs
+  or epochs and acknowledgements.
+- Bind every received envelope to the authenticated session and path that owns
+  its transport connection.
+- Dedup and reorder are per flow and bounded by packet count, bytes, and age.
+  A missing packet must expire rather than block unrelated flows.
+- First valid payload wins whether it arrives as a primary or redundant copy.
+- Compute effective payload MTU before sequence/packet-ID allocation. Failed
+  sends never count as delivered.
 
-## Code conventions that affect the wire
-- `ClientOptions` has no `Default`; every field is set at all 6 construction sites (3 in `apps/streamguard-service/tests/e2e.rs`, 3 in `client.rs` unit tests). Adding a field means updating all 6.
-- `PathMetrics::default()` has `reachable: false`; fresh entries must be `PathMetrics { reachable: true, ..Default::default() }` (unmetered = eligible).
-- Lock order: never hold `metrics` while acquiring `session`; `session → metrics` and `probes → metrics` are fine.
+## V1 containment
+
+- V1's 20-byte envelope, 48-bit sequence, four-byte session prefix, and
+  session-global reorder queue are experimental legacy behavior only.
+- Preserve those V1 rules only in explicitly scoped V1 tests or compatibility
+  seams. Do not copy them into V2 code.
+- V1 tests that use the existing reorder model still start at sequence zero and
+  echo the same sequence.
+
+## Shared code discipline
+
+- `PathMetrics::default()` starts unreachable; fresh usable entries explicitly
+  set `reachable: true`.
+- Never acquire `session` after `metrics`; use a documented lock order or
+  snapshot state before awaiting I/O.
+- Do not hold a lock across a network send, TUN operation, or control-stream
+  await unless the ownership proof is explicit and reviewed.

@@ -9,9 +9,10 @@ import type { Plugin } from "@opencode-ai/plugin"
  * surfaces the message and blocks the tool call.
  */
 export default (async () => {
-  const fmtRe = /^\s*cargo fmt(\s|$)/
-  const checkRe = /--check/
-  const binaryRe = /(\.dll|\.zip|wintun)/i
+  const fmtRe = /\bcargo\s+fmt\b/
+  const fmtCheckRe = /^\s*cargo\s+fmt\s+--check(?:\s|$)/
+  const sensitiveArtifactRe = /(\.dll|\.zip|\.der|\.pem|\.key|sgcerts|diagnostic|packet[-_ ]?capture)/i
+  const destructiveGitRe = /\bgit\s+(?:reset\s+--hard|clean\b|checkout\s+--|restore\b)/
 
   return {
     "tool.execute.before": async (input, output) => {
@@ -20,18 +21,26 @@ export default (async () => {
       const command: string = output.args?.command ?? ""
       if (!command) return
 
-      if (fmtRe.test(command) && !checkRe.test(command)) {
+      for (const segment of command.split(/;|&&|\|\|/)) {
+        if (fmtRe.test(segment) && !fmtCheckRe.test(segment)) {
+          throw new Error(
+            "Blocked: `cargo fmt` is forbidden in stream-guard. The repository is intentionally " +
+              "not rustfmt-formatted; only a standalone `cargo fmt --check` inspection is allowed."
+          )
+        }
+      }
+
+      if (destructiveGitRe.test(command)) {
         throw new Error(
-          "Blocked: `cargo fmt` (without --check) is forbidden in stream-guard. " +
-            "The repo is intentionally not rustfmt-formatted; running it rewrites the " +
-            "whole tree into an unrelated giant diff. Use `cargo fmt --check` to inspect only."
+          "Blocked: destructive Git commands require direct user handling. Do not reset, clean, " +
+            "restore, or checkout-discard a shared StreamGuard worktree."
         )
       }
 
-      if (/git (add|commit)\b/.test(command) && binaryRe.test(command)) {
+      if (/\bgit\s+add\b/.test(command) && (sensitiveArtifactRe.test(command) || /\bgit\s+add\s+(?:\.|-A|--all)(?:\s|$)/.test(command))) {
         throw new Error(
-          "Blocked: refusing to `git add`/`git commit` a binary artifact " +
-            "(Wintun .dll / .zip). These are gitignored build artifacts; never stage them."
+          "Blocked: stage explicit reviewed source files only. Never bulk-stage or stage generated " +
+            "keys, certificates, binaries, diagnostics, or packet captures."
         )
       }
     },

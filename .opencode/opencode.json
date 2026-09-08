@@ -1,18 +1,44 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "default_agent": "senior-rust-engineer",
+  "share": "disabled",
+  "snapshot": true,
+  "formatter": false,
+  "instructions": [
+    "AGENTS.md",
+    "REBUILD_V2_AGENT_PLAN.md"
+  ],
+  "skills": {
+    "paths": [
+      ".opencode/skills"
+    ]
+  },
+  "tool_output": {
+    "max_lines": 500,
+    "max_bytes": 32768
+  },
+  "compaction": {
+    "auto": true,
+    "prune": true,
+    "tail_turns": 12
+  },
   "permission": {
     "bash": {
       "*": "ask",
       "cargo check*": "allow",
-      "cargo check --all-targets*": "allow",
       "cargo test*": "allow",
       "cargo clippy*": "allow",
       "git status*": "allow",
       "git diff*": "allow",
       "git log*": "allow",
       "git grep*": "allow",
+      "git branch --show-current": "allow",
+      "git branch --list*": "allow",
       "cargo fmt*": "deny",
-      "cargo fmt --check*": "allow"
+      "git reset --hard*": "deny",
+      "git clean*": "deny",
+      "git checkout --*": "deny",
+      "git restore*": "deny"
     }
   }
 }
