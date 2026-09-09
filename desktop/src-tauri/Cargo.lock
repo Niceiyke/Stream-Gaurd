@@ -2783,6 +2783,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustls-pemfile"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c333bb734fcdedcea57de1602543590f545f127dc8b533324318fd492c5c70b"
+dependencies = [
+ "base64 0.21.7",
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "rustls-pki-types"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3069,7 +3079,9 @@ name = "sg-auth"
 version = "0.1.0"
 dependencies = [
  "ring",
+ "rustls",
  "sg-core",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3113,6 +3125,10 @@ dependencies = [
 name = "sg-platform"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "rustls",
+ "rustls-pemfile",
+ "sg-auth",
  "sg-core",
  "sg-tun",
  "windows",
@@ -3155,6 +3171,7 @@ dependencies = [
  "bytes",
  "quinn",
  "rustls",
+ "sg-auth",
  "sg-core",
  "sg-protocol",
  "socket2",

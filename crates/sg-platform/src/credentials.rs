@@ -79,7 +79,7 @@ fn build_device_credential(
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::fs::{File, OpenOptions};
+    use std::fs::OpenOptions;
     use std::io::{BufReader, Read};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
