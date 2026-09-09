@@ -1348,11 +1348,11 @@ fn probe_id_from_payload(payload: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(b))
 }
 
-/// RTT of a probe reply in milliseconds, from the sent timestamp (the
-/// `PathStatus` echoes the probe a moment after it was recorded as pending,
-/// so elapsed on the wire is a fair loopback approximation).
+/// RTT of a probe reply in milliseconds, from the sent timestamp. Loopback
+/// replies can arrive in under one millisecond, so keep a one-millisecond
+/// floor and reserve zero for an unmeasured status-plane value.
 fn probe_rtt_ms(sent: &std::time::Instant) -> u32 {
-    sent.elapsed().as_millis().min(u32::MAX as u128) as u32
+    sent.elapsed().as_millis().max(1).min(u32::MAX as u128) as u32
 }
 
 /// Picks the eligible path with the highest score among `paths`; an

@@ -13,7 +13,7 @@ libfuzzer-sys = "0.4"
 sg-protocol = { path = ".." }
 
 [[bin]]
-name = "v2_decode"
+name = "v2-decode"
 path = "fuzz_targets/v2_decode.rs"
 test = false
 doc = false
