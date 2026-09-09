@@ -1,0 +1,13 @@
+[package]
+name = "streamguard-netem"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Deterministic V2 post-admission network simulation harness"
+
+[dependencies]
+bytes.workspace = true
+sg-core.workspace = true
+sg-protocol.workspace = true

@@ -15,6 +15,7 @@ members = [
     "crates/sg-wordlyte",
     "apps/streamguard-service",
     "apps/streamguard-gateway",
+    "tests/netem",
 ]
 # `desktop/` (Tauri shell, engineering step 12) is deliberately NOT a member:
 # it keeps its own Cargo.lock/toolchain so a broken UI build can never affect

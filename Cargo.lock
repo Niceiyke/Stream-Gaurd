@@ -1028,6 +1028,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "streamguard-netem"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "sg-core",
+ "sg-protocol",
+]
+
+[[package]]
 name = "streamguard-service"
 version = "0.1.0"
 dependencies = [
