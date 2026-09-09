@@ -24,6 +24,9 @@
 /// This module is separate from the V1 HS256 compatibility code below. V2
 /// callers must use mutual TLS and the validator-only admission seam.
 pub mod device;
+/// V2 controller-signed admission-ticket verification. This module has no
+/// production signing API; only the controller may issue tickets.
+pub mod ticket;
 
 use ring::hmac::{HMAC_SHA256, Key as HmacKey, sign as hmac_sign, verify as hmac_verify};
 use sg_core::error::{Error, Result};

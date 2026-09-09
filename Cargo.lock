@@ -341,6 +341,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonwebtoken"
+version = "9.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
+dependencies = [
+ "base64 0.22.1",
+ "js-sys",
+ "ring",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -841,8 +854,11 @@ dependencies = [
 name = "sg-auth"
 version = "0.1.0"
 dependencies = [
+ "jsonwebtoken",
  "ring",
  "rustls",
+ "serde",
+ "serde_json",
  "sg-core",
  "thiserror",
 ]
@@ -1038,6 +1054,7 @@ dependencies = [
  "bytes",
  "quinn",
  "rcgen",
+ "rustls",
  "sg-auth",
  "sg-core",
  "sg-multipath",
@@ -1046,6 +1063,7 @@ dependencies = [
  "sg-session",
  "sg-transport",
  "sg-tun",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",

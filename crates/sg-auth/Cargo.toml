@@ -6,14 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 description = "StreamGuard gateway authentication: HS256 session tickets (JWT)"
 
-[features]
-default = []
-# Test-only resolver-backed credential provider. Production dependencies must
-# not enable this feature.
-test-credentials = []
-
 [dependencies]
+jsonwebtoken.workspace = true
 ring.workspace = true
 rustls.workspace = true
+serde.workspace = true
 sg-core.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

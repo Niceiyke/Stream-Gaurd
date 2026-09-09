@@ -12,6 +12,8 @@ use rustls::server::ResolvesServerCert;
 use sg_core::v2::DeviceId;
 use thiserror::Error;
 
+use crate::ticket::{ControllerTrustSnapshot, TicketVerificationError, VerifiedAdmissionTicket};
+
 /// Maximum roots accepted for one V2 trust domain.
 pub const MAX_TRUST_ANCHORS: usize = 32;
 /// Maximum CRLs accepted for one V2 device trust domain.
@@ -64,7 +66,7 @@ pub trait DeviceCredentialProvider: fmt::Debug + Send + Sync {
 /// Test-only credential provider that permits deterministic rotation tests
 /// without exposing certificate or private-key bytes. It remains behind the
 /// normal rustls resolver contract and is not an authentication bypass.
-#[cfg(any(test, feature = "test-credentials"))]
+#[cfg(test)]
 pub mod test_credentials {
     use std::fmt;
     use std::sync::{Arc, RwLock};
@@ -249,9 +251,11 @@ pub trait AdmissionTicketValidator: fmt::Debug + Send + Sync {
     fn validate(
         &self,
         ticket: &str,
+        trust: Option<&ControllerTrustSnapshot>,
+        now_unix_seconds: u64,
         verified_device: DeviceId,
         client_hello_device: DeviceId,
-    ) -> Result<(), DeviceCredentialError>;
+    ) -> Result<VerifiedAdmissionTicket, TicketVerificationError>;
 }
 
 /// Runs the WP-201 admission boundary after mTLS and `ClientHello` decoding.
@@ -260,13 +264,15 @@ pub trait AdmissionTicketValidator: fmt::Debug + Send + Sync {
 pub fn validate_admission_ticket(
     validator: &dyn AdmissionTicketValidator,
     ticket: &str,
+    trust: Option<&ControllerTrustSnapshot>,
+    now_unix_seconds: u64,
     verified_device: DeviceId,
     client_hello_device: DeviceId,
-) -> Result<(), DeviceCredentialError> {
+) -> Result<VerifiedAdmissionTicket, TicketVerificationError> {
     if verified_device != client_hello_device {
-        return Err(DeviceCredentialError::PeerIdentityMismatch);
+        return Err(TicketVerificationError::DeviceIdentityMismatch);
     }
-    validator.validate(ticket, verified_device, client_hello_device)
+    validator.validate(ticket, trust, now_unix_seconds, verified_device, client_hello_device)
 }
 
 /// Validates limits before an authenticated peer chain reaches an extractor.
@@ -350,10 +356,12 @@ mod tests {
         fn validate(
             &self,
             _ticket: &str,
+            _trust: Option<&ControllerTrustSnapshot>,
+            _now_unix_seconds: u64,
             _verified_device: DeviceId,
             _client_hello_device: DeviceId,
-        ) -> Result<(), DeviceCredentialError> {
-            Ok(())
+        ) -> Result<VerifiedAdmissionTicket, TicketVerificationError> {
+            unreachable!("identity mismatch must reject before validation")
         }
     }
 
@@ -394,10 +402,12 @@ mod tests {
             validate_admission_ticket(
                 &validator,
                 "test-only-ticket",
+                None,
+                1,
                 DeviceId::from_bytes([1; 16]),
                 DeviceId::from_bytes([2; 16]),
             ),
-            Err(DeviceCredentialError::PeerIdentityMismatch)
+            Err(TicketVerificationError::DeviceIdentityMismatch)
         );
     }
 

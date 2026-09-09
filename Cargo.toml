@@ -32,6 +32,7 @@ license = "MIT"
 anyhow = "1"
 async-trait = "0.1"
 bytes = "1"
+jsonwebtoken = { version = "=9.3.1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # `socket2` 0.6's `all` feature exposes the Linux index-based interface
