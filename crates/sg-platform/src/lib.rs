@@ -14,6 +14,9 @@
 use sg_core::error::{Error, Result};
 
 pub mod gateway_net;
+/// V2 secure-store credential construction boundary. Concrete OS stores are
+/// intentionally deferred; it is never coupled to status IPC credentials.
+pub mod credentials;
 
 /// Selected-app WFP enforcement scaffold (spec 19, spec 28 row 15).
 ///

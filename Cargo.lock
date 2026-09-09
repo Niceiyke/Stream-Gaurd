@@ -59,6 +59,12 @@ dependencies = [
 
 [[package]]
 name = "base64"
+version = "0.21.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
+
+[[package]]
+name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
@@ -187,7 +193,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -536,7 +542,7 @@ version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "serde_core",
 ]
 
@@ -745,6 +751,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustls-pemfile"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c333bb734fcdedcea57de1602543590f545f127dc8b533324318fd492c5c70b"
+dependencies = [
+ "base64 0.21.7",
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "rustls-pki-types"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -826,7 +842,9 @@ name = "sg-auth"
 version = "0.1.0"
 dependencies = [
  "ring",
+ "rustls",
  "sg-core",
+ "thiserror",
 ]
 
 [[package]]
@@ -870,6 +888,11 @@ dependencies = [
 name = "sg-platform"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "sg-auth",
  "sg-core",
  "sg-tun",
  "windows",
@@ -914,6 +937,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "rustls",
+ "sg-auth",
  "sg-core",
  "sg-protocol",
  "socket2",

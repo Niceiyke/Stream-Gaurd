@@ -19,6 +19,12 @@
 //! design) is a follow-up milestone; `sg_transport::quic::server_tls` still
 //! uses `with_no_client_auth`.
 
+/// V2 device identity, TLS trust, and admission-validation contracts.
+///
+/// This module is separate from the V1 HS256 compatibility code below. V2
+/// callers must use mutual TLS and the validator-only admission seam.
+pub mod device;
+
 use ring::hmac::{HMAC_SHA256, Key as HmacKey, sign as hmac_sign, verify as hmac_verify};
 use sg_core::error::{Error, Result};
 use sg_core::SessionId;
