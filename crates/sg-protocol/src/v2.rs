@@ -16,7 +16,7 @@ pub const FIXED_HEADER_LEN: usize = 52;
 
 /// Direction prevents packet identity reuse across the two tunnel directions.
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Direction {
     ClientToGateway = 1,
     GatewayToClient = 2,

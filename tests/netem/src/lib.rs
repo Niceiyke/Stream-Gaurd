@@ -126,7 +126,7 @@ pub struct DirectionalPathProfile {
     pub jitter_ms: u64,
     pub loss_ppm: u32,
     pub duplicate_ppm: u32,
-    /// Full V2 datagram MTU, including the fixed 48-byte envelope header.
+    /// Full V2 datagram MTU, including the fixed 52-byte envelope header.
     pub datagram_mtu: usize,
     /// The connection closes at this simulated monotonic time.
     pub connection_loss_at_ms: Option<u64>,

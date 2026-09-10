@@ -4,6 +4,13 @@
 //! Phase 1: active/standby. Phase 2: adaptive redundancy. Phase 3:
 //! weighted bonding. The scheduler is the primary differentiating
 //! component and owns authoritative path state.
+//!
+//! V2 per-flow delivery lives under [`v2`] and is strictly separate from the
+//! V1 session-global [`ReorderBuffer`] below, which remains untouched for
+//! development tests until the V2 cutover policy is satisfied.
+
+/// Production V2 per-flow classifier, dedup, and deadline reorder (WP-301).
+pub mod v2;
 
 use std::collections::{BTreeMap, HashMap};
 

@@ -888,6 +888,7 @@ dependencies = [
  "sg-core",
  "sg-health",
  "sg-protocol",
+ "thiserror",
 ]
 
 [[package]]
