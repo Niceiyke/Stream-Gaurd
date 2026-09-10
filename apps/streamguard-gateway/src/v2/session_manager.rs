@@ -620,13 +620,11 @@ impl V2SessionManager {
                 || session.session.path(path_id).is_none_or(|path| path.state != PathState::Healthy)
             {
                 Err(V2SessionManagerError::BindingMismatch)
+            } else if let Some(session) = state.sessions.get_mut(&session_id) {
+                session.last_activity_ms = now_ms;
+                Ok(ValidatedIngress { session_id, path_id, path_epoch, key_epoch })
             } else {
-                if let Some(session) = state.sessions.get_mut(&session_id) {
-                    session.last_activity_ms = now_ms;
-                    Ok(ValidatedIngress { session_id, path_id, path_epoch, key_epoch })
-                } else {
-                    Err(V2SessionManagerError::UnknownSession)
-                }
+                Err(V2SessionManagerError::UnknownSession)
             }
         };
         if let Some(removal) = cleanup {
