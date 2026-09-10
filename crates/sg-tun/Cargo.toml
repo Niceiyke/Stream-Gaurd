@@ -17,4 +17,12 @@ native-tun = ["dep:tun-rs"]
 [dependencies]
 bytes.workspace = true
 sg-core.workspace = true
-tun-rs = { workspace = true, optional = true }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# `interruptible` (tun-rs 2.8.9, no extra deps) provides the verified
+# timed/cancellable read used by the native `TunInterrupt` backend:
+# `SyncDevice::recv_intr_timeout` maps to `poll()` + event pipe on Linux
+# and `WaitForMultipleObjects` + event on Windows, returning
+# `TimedOut`/`Interrupted` instead of blocking forever (WP-300 req 4).
+tun-rs = { workspace = true, optional = true, features = ["interruptible"] }

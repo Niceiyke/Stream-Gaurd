@@ -8,3 +8,6 @@
 pub mod client;
 pub mod ipc;
 pub mod status;
+/// V2 client engine supervisor (REBUILD WP-300). Isolated from the V1 client
+/// engine until cutover; owns the blocking TUN driver boundary only.
+pub mod v2;
