@@ -1,7 +1,7 @@
 ---
 description: V2 Rust implementation lead for StreamGuard. Builds one approved work packet at a time from REBUILD_V2_AGENT_PLAN.md, with secure multipath networking, bounded state, and verified delivery.
 mode: subagent
-model: openai/gpt-5.6-terra
+model: opencode/big-pickle
 permission:
   task: allow
   todowrite: allow
