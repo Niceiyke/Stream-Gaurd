@@ -24,7 +24,7 @@
   },
   "permission": {
     "bash": {
-      "*": "ask",
+      "*": "allow",
       "cargo check*": "allow",
       "cargo test*": "allow",
       "cargo clippy*": "allow",
