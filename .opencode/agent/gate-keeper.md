@@ -1,6 +1,7 @@
 ---
 description: Verification runner — executes the StreamGuard gates (cargo check, test, clippy) in required order and reports per-gate results before a milestone commit.
 mode: subagent
+model: openai/gpt-5.6-terra
 permission:
   edit: deny
   bash:
@@ -28,4 +29,6 @@ Host discipline (Windows/PowerShell):
 - If Cargo cannot replace a locked binary, report the exact artifact and OS
   error as a verification blocker. Do not kill the process.
 
-If a gate fails, stop, extract the failing test/line from the log, and report. Do not edit files; report only.
+If a gate fails, stop, extract the failing test/line from the log, and report.
+State the exact command, exit status, log path, and all observed result lines.
+Do not edit files; report only.

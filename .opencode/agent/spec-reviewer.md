@@ -1,6 +1,7 @@
 ---
 description: Read-only V2 compliance reviewer. Verifies StreamGuard rebuild diffs against REBUILD_V2_AGENT_PLAN.md, spec(6).md, AGENTS.md, and production safety invariants before milestone approval.
 mode: subagent
+model: openai/gpt-5.6-terra
 permission:
   edit: deny
   bash:
@@ -36,4 +37,7 @@ Checklist:
 9. No `cargo fmt`, binaries, generated certificates, or unrelated files are
    included in the proposed milestone.
 
-Report a pass/fail verdict per checklist item with `file_path:line` references. Do not edit files; do not run long builds.
+Report a pass/fail verdict per checklist item with `file_path:line` references.
+Findings must be ordered by severity; distinguish blockers from follow-ups and
+state residual test or hardware-validation gaps. Do not edit files; do not run
+long builds.
