@@ -13,8 +13,9 @@ use sg_auth::device::{
     DeviceTrustAnchors, GatewayTlsIdentity, VerifiedPeerDeviceIdentityExtractor,
 };
 use sg_auth::ticket::ControllerTrustSnapshot;
+use sg_core::v2::PathId;
 use sg_protocol::v2::control::{
-    ControlFrame, ControlFrameLimit, ControlMessage, SafeModePolicy,
+    ControlFrame, ControlFrameLimit, ControlMessage, RejectCode, SafeModePolicy,
 };
 use sg_transport::quic::{v2_peer_device_identity, v2_server_tls};
 use sg_transport::v2::{ControlDeadlines, ControlFramed};
@@ -24,6 +25,7 @@ use super::admission::{
     AdmissionAccepted, AdmissionHandler, AdmissionTime,
     BoundedClientHello,
 };
+use super::session_manager::{AuthenticatedConnection, Clock};
 
 /// Static V2 control-admission data. Address allocation and policy ownership
 /// move to WP-202/WP-400; these validated values only permit a bounded
@@ -171,13 +173,31 @@ where
         self.endpoint.local_addr().map_err(|_| V2AdmissionListenerError::Endpoint)
     }
 
-    /// Accepts one V2 control admission. A limiter permit is acquired from the
-    /// peer's UDP source before beginning the QUIC handshake and released by
-    /// RAII after it completes or times out. No mutex guard crosses an await.
+    /// Accepts one V2 control admission using the lifecycle clock. The
+    /// `AdmissionTime` is derived from the injected clock so ticket claims
+    /// are validated against real unix time while TTL-based state uses
+    /// monotonic time. A limiter permit is acquired from the peer's UDP
+    /// source before beginning the QUIC handshake and released by RAII
+    /// after it completes or times out. No mutex guard crosses an await.
     pub async fn accept_one(
         &self,
+        clock: &dyn Clock,
+    ) -> Result<V2AdmittedConnection<V>, V2AdmissionListenerError> {
+        self.accept_one_at(AdmissionTime {
+            unix_seconds: clock.unix_seconds(),
+            monotonic_millis: clock.monotonic_ms(),
+        })
+        .await
+    }
+
+    /// Deterministic admission entry point. Callers supply the exact
+    /// [`AdmissionTime`], which keeps resource policy and ticket validation
+    /// fully reproducible without a real clock. Production callers should
+    /// use [`accept_one`](Self::accept_one) with the lifecycle clock.
+    pub async fn accept_one_at(
+        &self,
         now: AdmissionTime,
-    ) -> Result<V2AdmittedConnection, V2AdmissionListenerError> {
+    ) -> Result<V2AdmittedConnection<V>, V2AdmissionListenerError> {
         let accepted_at = Instant::now();
         let incoming = self.endpoint.accept().await.ok_or(V2AdmissionListenerError::EndpointClosed)?;
         let source = incoming.remote_address().ip();
@@ -231,6 +251,10 @@ where
         // Never validate a ticket against the time the UDP accept began: a
         // handshake or control read can cross its expiry or verification budget.
         let admission_now = advance_admission_time(now, accepted_at.elapsed());
+        if self.handler.sweep(admission_now.monotonic_millis).is_err() {
+            close_rejected(&connection);
+            return Err(V2AdmissionListenerError::AdmissionRejected);
+        }
         let admitted = match self.handler.admit(
             source,
             peer,
@@ -254,10 +278,27 @@ where
         };
         let mut framed_send = ControlFramed::new(send, self.config.control_frame_limit, self.config.control_deadlines);
         if framed_send.write_frame(&response).await.is_err() {
+            self.handler.abort(admitted);
             close_rejected(&connection);
             return Err(V2AdmissionListenerError::ResponseWrite);
         }
-        Ok(V2AdmittedConnection { connection, admitted })
+        let authenticated_connection = match self.handler.commit_and_bind(admitted, admission_now) {
+            Ok(connection) => connection,
+            Err(_) => {
+                self.handler.abort(admitted);
+                close_rejected(&connection);
+                return Err(V2AdmissionListenerError::AdmissionRejected);
+            }
+        };
+        Ok(V2AdmittedConnection {
+            connection,
+            admitted,
+            authenticated_connection: Some(authenticated_connection),
+            attached_path: None,
+            handler: Arc::clone(&self.handler),
+            control_send: framed_send,
+            control_recv: framed_recv,
+        })
     }
 }
 
@@ -276,14 +317,27 @@ impl<V> fmt::Debug for V2AdmissionListener<V> {
     }
 }
 
-/// Holds the admitted Quinn connection. It intentionally exposes no packet or
-/// path API; WP-202/WP-600 own the next lifecycle/control-stream steps.
-pub struct V2AdmittedConnection {
+/// Holds the admitted Quinn connection and its one reliable control stream.
+/// It intentionally exposes no datagram, TUN, or flow API.
+pub struct V2AdmittedConnection<V: sg_auth::device::AdmissionTicketValidator> {
     connection: quinn::Connection,
     admitted: AdmissionAccepted,
+    authenticated_connection: Option<AuthenticatedConnection>,
+    attached_path: Option<ListenerPathBinding>,
+    handler: Arc<AdmissionHandler<V>>,
+    control_send: ControlFramed<quinn::SendStream>,
+    control_recv: ControlFramed<quinn::RecvStream>,
 }
 
-impl V2AdmittedConnection {
+#[derive(Clone, Copy)]
+struct ListenerPathBinding {
+    path_id: PathId,
+    path_epoch: u64,
+    key_epoch: u32,
+    path_nonce: [u8; 16],
+}
+
+impl<V: sg_auth::device::AdmissionTicketValidator> V2AdmittedConnection<V> {
     #[must_use]
     pub fn admission(&self) -> AdmissionAccepted {
         self.admitted
@@ -293,11 +347,140 @@ impl V2AdmittedConnection {
     pub fn remote_address(&self) -> SocketAddr {
         self.connection.remote_address()
     }
+
+    /// Processes one reliable path-control request. Path attachment, detach,
+    /// and close are bound to this listener-created authenticated connection.
+    pub async fn handle_next_control(&mut self, now_ms: u64) -> Result<(), V2AdmissionListenerError> {
+        let frame = match self.control_recv.read_frame().await {
+            Ok(frame) => frame,
+            Err(_) => {
+                let _ = self.close();
+                return Err(V2AdmissionListenerError::ControlStream);
+            }
+        };
+        self.handler.sweep(now_ms).map_err(|_| V2AdmissionListenerError::ConnectionCleanup)?;
+        let response = match frame.message {
+            ControlMessage::PathAttach {
+                session_id,
+                path_nonce,
+                path_epoch,
+                key_epoch,
+                ..
+            } if session_id == self.admitted.owner().session_id() => {
+                if let Some(path) = self.attached_path {
+                    if path.path_epoch == path_epoch && path.key_epoch == key_epoch && path.path_nonce == path_nonce {
+                        let connection = self.authenticated_connection.ok_or(V2AdmissionListenerError::ConnectionClosed)?;
+                        if self
+                            .handler
+                            .validate_attached_path(connection, path.path_id, path.path_epoch, path.key_epoch, now_ms)
+                            .is_ok()
+                        {
+                            ControlFrame {
+                                transaction_id: frame.transaction_id,
+                                message: ControlMessage::PathAttached {
+                                    session_id,
+                                    path_id: path.path_id,
+                                    path_epoch,
+                                },
+                            }
+                        } else {
+                            reject(frame.transaction_id, RejectCode::InvalidState, "cached path attachment is no longer valid")
+                        }
+                    } else {
+                        reject(frame.transaction_id, RejectCode::StaleEpoch, "connection is already attached")
+                    }
+                } else {
+                let connection = self.authenticated_connection.ok_or(V2AdmissionListenerError::ConnectionClosed)?;
+                match self.handler.reserve_attach(connection, path_epoch, key_epoch, now_ms) {
+                    Ok(reservation) => match self.handler.commit_attach(reservation) {
+                        Ok(path) => {
+                            self.attached_path = Some(ListenerPathBinding {
+                                path_id: path.path_id,
+                                path_epoch: path.path_epoch,
+                                key_epoch: path.key_epoch,
+                                path_nonce,
+                            });
+                            ControlFrame {
+                                transaction_id: frame.transaction_id,
+                                message: ControlMessage::PathAttached {
+                                    session_id,
+                                    path_id: path.path_id,
+                                    path_epoch: path.path_epoch,
+                                },
+                            }
+                        }
+                        Err(_) => reject(frame.transaction_id, RejectCode::InvalidState, "path attach could not commit"),
+                    },
+                    Err(_) => reject(frame.transaction_id, RejectCode::InvalidState, "path attach rejected"),
+                }
+                }
+            }
+            ControlMessage::PathDetach {
+                session_id,
+                path_id,
+                path_epoch,
+                ..
+            } if session_id == self.admitted.owner().session_id() => {
+                let connection = self.authenticated_connection.ok_or(V2AdmissionListenerError::ConnectionClosed)?;
+                match self.handler.detach_connection(connection, path_id, path_epoch, now_ms) {
+                    Ok(true) => {
+                        self.attached_path = None;
+                        ControlFrame { transaction_id: frame.transaction_id, message: ControlMessage::Ack }
+                    }
+                    Ok(false) => ControlFrame { transaction_id: frame.transaction_id, message: ControlMessage::Ack },
+                    Err(_) => reject(frame.transaction_id, RejectCode::UnknownPath, "path detach rejected"),
+                }
+            }
+            ControlMessage::Close { session_id, .. } if session_id == self.admitted.owner().session_id() => {
+                self.close_session()?;
+                ControlFrame { transaction_id: frame.transaction_id, message: ControlMessage::Ack }
+            }
+            _ => reject(frame.transaction_id, RejectCode::InvalidDirection, "control request is not valid for this connection"),
+        };
+        if self.control_send.write_frame(&response).await.is_err() {
+            let _ = self.close();
+            return Err(V2AdmissionListenerError::ControlStream);
+        }
+        Ok(())
+    }
+
+    /// Releases this connection's pending or committed path exactly once.
+    pub fn close(&mut self) -> Result<bool, V2AdmissionListenerError> {
+        let Some(connection) = self.authenticated_connection.take() else {
+            return Ok(false);
+        };
+        self.attached_path = None;
+        self.handler.close_connection(connection).map_err(|_| V2AdmissionListenerError::ConnectionCleanup)
+    }
+
+    /// Closes the admitted session, not just this QUIC path. The manager first
+    /// invalidates every connection capability and path binding, then invokes
+    /// cleanup after releasing its state lock.
+    fn close_session(&mut self) -> Result<bool, V2AdmissionListenerError> {
+        let Some(connection) = self.authenticated_connection.take() else {
+            return Ok(false);
+        };
+        self.attached_path = None;
+        self.handler.close_session(connection).map_err(|_| V2AdmissionListenerError::ConnectionCleanup)
+    }
 }
 
-impl fmt::Debug for V2AdmittedConnection {
+impl<V: sg_auth::device::AdmissionTicketValidator> Drop for V2AdmittedConnection<V> {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+impl<V: sg_auth::device::AdmissionTicketValidator> fmt::Debug for V2AdmittedConnection<V> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("V2AdmittedConnection(REDACTED)")
+    }
+}
+
+fn reject(transaction_id: u64, code: RejectCode, reason: &str) -> ControlFrame {
+    ControlFrame {
+        transaction_id,
+        message: ControlMessage::Reject { code, reason: reason.into() },
     }
 }
 
@@ -335,4 +518,8 @@ pub enum V2AdmissionListenerError {
     InvalidAdmission,
     #[error("V2 SessionAdmit write failed")]
     ResponseWrite,
+    #[error("V2 authenticated connection is already closed")]
+    ConnectionClosed,
+    #[error("V2 authenticated connection cleanup failed")]
+    ConnectionCleanup,
 }

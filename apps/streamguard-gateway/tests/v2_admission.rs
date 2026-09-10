@@ -14,16 +14,17 @@ use sg_auth::device::{
     GatewayTlsIdentity, GatewayTrustAnchors, VerifiedPeerDeviceIdentityExtractor,
 };
 use sg_auth::ticket::{ControllerPublicKey, ControllerTrustSnapshot, TicketVerifier};
-use sg_core::v2::DeviceId;
+use sg_core::v2::{DeviceId, SessionId};
 use sg_protocol::v2::control::{
     AdmissionTicket, ControlFrame, ControlFrameLimit, ControlMessage, SafeModePolicy,
 };
 use sg_transport::quic::{v2_client_tls, v2_connect_path};
 use sg_transport::v2::{ControlDeadlines, ControlFramed};
 use streamguard_gateway::v2::admission::{
-    AdmissionHandler, AdmissionOwnerRegistry, AdmissionOwnerRegistryConfig, AdmissionTime,
+    AdmissionHandler, AdmissionTime,
     HandshakeAdmissionLimiter, HandshakeAdmissionLimiterConfig, ReplayCache,
 };
+use streamguard_gateway::v2::session_manager::{V2SessionManager, V2SessionManagerConfig};
 use streamguard_gateway::v2::listener::{
     SessionAdmitTemplate, V2AdmissionListener, V2AdmissionListenerConfig,
     V2AdmissionListenerSetup, V2AdmissionTls,
@@ -206,7 +207,7 @@ fn pki() -> TestPki {
     }
 }
 
-fn handler() -> Arc<AdmissionHandler<TicketVerifier>> {
+fn handler_with_sessions(sessions: Arc<V2SessionManager>) -> Arc<AdmissionHandler<TicketVerifier>> {
     Arc::new(AdmissionHandler::new(
         TicketVerifier::new("controller.example".into(), "gateway-group-a".into(), "us-east-1".into()).unwrap(),
         HandshakeAdmissionLimiter::new(HandshakeAdmissionLimiterConfig {
@@ -218,8 +219,21 @@ fn handler() -> Arc<AdmissionHandler<TicketVerifier>> {
         })
         .unwrap(),
         ReplayCache::new(8).unwrap(),
-        AdmissionOwnerRegistry::new(AdmissionOwnerRegistryConfig { capacity: 4, ttl_seconds: 120 }).unwrap(),
+        sessions,
     ))
+}
+
+fn handler() -> Arc<AdmissionHandler<TicketVerifier>> {
+    handler_with_sessions(Arc::new(V2SessionManager::new(V2SessionManagerConfig {
+            maximum_sessions: 4,
+            idle_ttl_ms: 120_000,
+            maximum_paths_per_session: 4,
+            maximum_pending_attaches: 4,
+            pending_attach_ttl_ms: 5_000,
+            maximum_path_epoch_history: 16,
+            maximum_path_tombstones: 4,
+            path_tombstone_ttl_ms: 5_000,
+        }).unwrap()))
 }
 
 fn trust() -> Arc<ControllerTrustSnapshot> {
@@ -269,6 +283,15 @@ async fn connect_and_send(
     pki: &TestPki,
     frame: ControlFrame,
 ) -> (quinn::Connection, quinn::RecvStream) {
+    let (client, mut send, recv) = connect_and_open(address, pki).await;
+    send.write_frame(&frame).await.unwrap();
+    (client, recv.into_inner())
+}
+
+async fn connect_and_open(
+    address: std::net::SocketAddr,
+    pki: &TestPki,
+) -> (quinn::Connection, ControlFramed<quinn::SendStream>, ControlFramed<quinn::RecvStream>) {
     let client = v2_connect_path(
         address,
         &GatewayName::new("localhost").unwrap(),
@@ -277,9 +300,11 @@ async fn connect_and_send(
     .await
     .unwrap();
     let (send, recv) = client.open_bi().await.unwrap();
-    let mut framed = ControlFramed::new(send, ControlFrameLimit::default(), ControlDeadlines { read: TEST_TIMEOUT, write: TEST_TIMEOUT });
-    framed.write_frame(&frame).await.unwrap();
-    (client, recv)
+    (
+        client,
+        ControlFramed::new(send, ControlFrameLimit::default(), ControlDeadlines { read: TEST_TIMEOUT, write: TEST_TIMEOUT }),
+        ControlFramed::new(recv, ControlFrameLimit::default(), ControlDeadlines { read: TEST_TIMEOUT, write: TEST_TIMEOUT }),
+    )
 }
 
 #[tokio::test]
@@ -300,7 +325,7 @@ async fn v2_mtls_listener_admits_framed_hello_and_emits_session_admit() {
     .unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        listener.accept_one(AdmissionTime { unix_seconds: 1_000, monotonic_millis: 1 }).await
+        listener.accept_one_at(AdmissionTime { unix_seconds: 1_000, monotonic_millis: 1 }).await
     });
     let (_client, recv) = connect_and_send(address, &ticket_pki, hello(FIXTURE_TICKET, DeviceId::from_bytes([2; 16]))).await;
     let mut framed = ControlFramed::new(recv, ControlFrameLimit::default(), ControlDeadlines { read: TEST_TIMEOUT, write: TEST_TIMEOUT });
@@ -308,11 +333,242 @@ async fn v2_mtls_listener_admits_framed_hello_and_emits_session_admit() {
     assert!(matches!(response.message, ControlMessage::SessionAdmit { session_id, policy_epoch: 1, .. } if session_id == sg_core::v2::SessionId::from_bytes([4; 16])));
     let admitted = timeout(TEST_TIMEOUT, server).await.unwrap().unwrap().unwrap();
     assert_eq!(admitted.admission().owner().device_id(), DeviceId::from_bytes([2; 16]));
-    assert_eq!(ticket_handler.metrics().owners.entries, 1);
+    assert_eq!(ticket_handler.metrics().sessions.sessions, 1);
 }
 
 #[tokio::test]
-async fn distinct_jtis_reuse_only_the_matching_v2_owner() {
+async fn admitted_connection_owns_bound_path_control_and_protocol_close_cleanup() {
+    let ticket_pki = pki();
+    let ticket_handler = handler();
+    let listener = V2AdmissionListener::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        V2AdmissionTls { gateway_identity: &ticket_pki.gateway_identity, device_trust: &ticket_pki.device_trust },
+        V2AdmissionListenerSetup {
+            handler: Arc::clone(&ticket_handler),
+            extractor: Arc::new(ChainExtractor { certificate: ticket_pki.client_certificate.clone(), device_id: DeviceId::from_bytes([2; 16]), reject: false }),
+            trust: trust(),
+            template: template(),
+            config: listener_config(),
+        },
+    )
+    .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        listener.accept_one_at(AdmissionTime { unix_seconds: 1_000, monotonic_millis: 1 }).await
+    });
+    let (_client, mut send, mut recv) = connect_and_open(address, &ticket_pki).await;
+    send.write_frame(&hello(FIXTURE_TICKET, DeviceId::from_bytes([2; 16]))).await.unwrap();
+    let admit = recv.read_frame().await.unwrap();
+    let session_id = match admit.message {
+        ControlMessage::SessionAdmit { session_id, .. } => session_id,
+        _ => panic!("listener must admit the authenticated session"),
+    };
+    let mut admitted = timeout(TEST_TIMEOUT, server).await.unwrap().unwrap().unwrap();
+    let attach = ControlFrame {
+        transaction_id: 2,
+        message: ControlMessage::PathAttach {
+            session_id,
+            path_nonce: [9; 16],
+            path_epoch: 1,
+            key_epoch: 7,
+            metadata: Bytes::from_static(b"wifi"),
+        },
+    };
+    send.write_frame(&attach).await.unwrap();
+    admitted.handle_next_control(2).await.unwrap();
+    let first_path = recv.read_frame().await.unwrap();
+    assert!(matches!(&first_path.message, ControlMessage::PathAttached { session_id: reply_session, path_epoch: 1, .. } if *reply_session == session_id));
+    send.write_frame(&attach).await.unwrap();
+    admitted.handle_next_control(2).await.unwrap();
+    assert_eq!(recv.read_frame().await.unwrap(), first_path);
+    assert_eq!(ticket_handler.metrics().sessions.paths, 1);
+    send.write_frame(&ControlFrame {
+        transaction_id: 3,
+        message: ControlMessage::Close {
+            session_id,
+            reason: "operator request".into(),
+        },
+    })
+    .await
+    .unwrap();
+    admitted.handle_next_control(3).await.unwrap();
+    assert_eq!(
+        recv.read_frame().await.unwrap(),
+        ControlFrame {
+            transaction_id: 3,
+            message: ControlMessage::Ack,
+        }
+    );
+    let snapshot = ticket_handler.metrics().sessions;
+    assert_eq!(snapshot.sessions, 0);
+    assert_eq!(snapshot.paths, 0);
+    assert_eq!(snapshot.authenticated_connections, 0);
+    drop(admitted);
+    let snapshot = ticket_handler.metrics().sessions;
+    assert_eq!(snapshot.paths, 0);
+    assert_eq!(snapshot.authenticated_connections, 0);
+}
+
+#[tokio::test]
+async fn peer_control_stream_close_releases_connection_and_path_without_server_drop() {
+    let ticket_pki = pki();
+    let ticket_handler = handler();
+    let listener = V2AdmissionListener::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        V2AdmissionTls { gateway_identity: &ticket_pki.gateway_identity, device_trust: &ticket_pki.device_trust },
+        V2AdmissionListenerSetup {
+            handler: Arc::clone(&ticket_handler),
+            extractor: Arc::new(ChainExtractor { certificate: ticket_pki.client_certificate.clone(), device_id: DeviceId::from_bytes([2; 16]), reject: false }),
+            trust: trust(),
+            template: template(),
+            config: listener_config(),
+        },
+    )
+    .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        listener.accept_one_at(AdmissionTime { unix_seconds: 1_000, monotonic_millis: 1 }).await
+    });
+    let (_client, mut send, mut recv) = connect_and_open(address, &ticket_pki).await;
+    send.write_frame(&hello(FIXTURE_TICKET, DeviceId::from_bytes([2; 16]))).await.unwrap();
+    let session_id = match recv.read_frame().await.unwrap().message {
+        ControlMessage::SessionAdmit { session_id, .. } => session_id,
+        _ => panic!("listener must admit the authenticated session"),
+    };
+    let mut admitted = timeout(TEST_TIMEOUT, server).await.unwrap().unwrap().unwrap();
+    send.write_frame(&ControlFrame {
+        transaction_id: 2,
+        message: ControlMessage::PathAttach {
+            session_id,
+            path_nonce: [9; 16],
+            path_epoch: 1,
+            key_epoch: 7,
+            metadata: Bytes::from_static(b"wifi"),
+        },
+    })
+    .await
+    .unwrap();
+    admitted.handle_next_control(2).await.unwrap();
+    assert!(matches!(recv.read_frame().await.unwrap().message, ControlMessage::PathAttached { .. }));
+    assert_eq!(ticket_handler.metrics().sessions.authenticated_connections, 1);
+    assert_eq!(ticket_handler.metrics().sessions.paths, 1);
+
+    send.into_inner().finish().unwrap();
+    assert_eq!(
+        admitted.handle_next_control(3).await,
+        Err(streamguard_gateway::v2::listener::V2AdmissionListenerError::ControlStream)
+    );
+
+    // `admitted` remains live: cleanup must come from the failed control read.
+    let snapshot = ticket_handler.metrics().sessions;
+    assert_eq!(snapshot.sessions, 1);
+    assert_eq!(snapshot.authenticated_connections, 0);
+    assert_eq!(snapshot.paths, 0);
+}
+
+#[tokio::test]
+async fn listener_sweeps_idle_sessions_before_admission() {
+    let ticket_pki = pki();
+    let sessions = Arc::new(V2SessionManager::new(V2SessionManagerConfig {
+        maximum_sessions: 1,
+        idle_ttl_ms: 10,
+        maximum_paths_per_session: 1,
+        maximum_pending_attaches: 1,
+        pending_attach_ttl_ms: 5,
+        maximum_path_epoch_history: 4,
+        maximum_path_tombstones: 1,
+        path_tombstone_ttl_ms: 5,
+    }).unwrap());
+    let stale = sessions.reserve_admission(
+        SessionId::from_bytes([9; 16]),
+        DeviceId::from_bytes([8; 16]),
+        sg_auth::ticket::OrganizationId::from_bytes([3; 16]),
+        1_000_000,
+        1,
+    ).unwrap();
+    sessions.commit_admission(stale, 1).unwrap();
+    let ticket_handler = handler_with_sessions(Arc::clone(&sessions));
+    let listener = V2AdmissionListener::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        V2AdmissionTls { gateway_identity: &ticket_pki.gateway_identity, device_trust: &ticket_pki.device_trust },
+        V2AdmissionListenerSetup {
+            handler: Arc::clone(&ticket_handler),
+            extractor: Arc::new(ChainExtractor { certificate: ticket_pki.client_certificate.clone(), device_id: DeviceId::from_bytes([2; 16]), reject: false }),
+            trust: trust(),
+            template: template(),
+            config: listener_config(),
+        },
+    )
+    .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        listener.accept_one_at(AdmissionTime { unix_seconds: 1_000, monotonic_millis: 11 }).await
+    });
+    let (_client, recv) = connect_and_send(address, &ticket_pki, hello(FIXTURE_TICKET, DeviceId::from_bytes([2; 16]))).await;
+    let mut framed = ControlFramed::new(recv, ControlFrameLimit::default(), ControlDeadlines { read: TEST_TIMEOUT, write: TEST_TIMEOUT });
+    assert!(matches!(framed.read_frame().await.unwrap().message, ControlMessage::SessionAdmit { .. }));
+    assert!(timeout(TEST_TIMEOUT, server).await.unwrap().unwrap().is_ok());
+    let snapshot = ticket_handler.metrics().sessions;
+    assert_eq!(snapshot.sessions, 1);
+    assert_eq!(snapshot.sessions_idle, 1);
+}
+
+#[tokio::test]
+async fn cached_path_attach_revalidates_after_control_sweep() {
+    let ticket_pki = pki();
+    let ticket_handler = handler();
+    let listener = V2AdmissionListener::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        V2AdmissionTls { gateway_identity: &ticket_pki.gateway_identity, device_trust: &ticket_pki.device_trust },
+        V2AdmissionListenerSetup {
+            handler: Arc::clone(&ticket_handler),
+            extractor: Arc::new(ChainExtractor { certificate: ticket_pki.client_certificate.clone(), device_id: DeviceId::from_bytes([2; 16]), reject: false }),
+            trust: trust(),
+            template: template(),
+            config: listener_config(),
+        },
+    )
+    .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        listener.accept_one_at(AdmissionTime { unix_seconds: 1_000, monotonic_millis: 1 }).await
+    });
+    let (_client, mut send, mut recv) = connect_and_open(address, &ticket_pki).await;
+    send.write_frame(&hello(FIXTURE_TICKET, DeviceId::from_bytes([2; 16]))).await.unwrap();
+    let session_id = match recv.read_frame().await.unwrap().message {
+        ControlMessage::SessionAdmit { session_id, .. } => session_id,
+        _ => panic!("listener must admit the authenticated session"),
+    };
+    let mut admitted = timeout(TEST_TIMEOUT, server).await.unwrap().unwrap().unwrap();
+    let attach = ControlFrame {
+        transaction_id: 2,
+        message: ControlMessage::PathAttach {
+            session_id,
+            path_nonce: [9; 16],
+            path_epoch: 1,
+            key_epoch: 7,
+            metadata: Bytes::from_static(b"wifi"),
+        },
+    };
+    send.write_frame(&attach).await.unwrap();
+    admitted.handle_next_control(2).await.unwrap();
+    assert!(matches!(recv.read_frame().await.unwrap().message, ControlMessage::PathAttached { .. }));
+
+    send.write_frame(&attach).await.unwrap();
+    admitted.handle_next_control(120_001).await.unwrap();
+    let response = recv.read_frame().await.unwrap();
+    assert!(matches!(
+        response.message,
+        ControlMessage::Reject { code: sg_protocol::v2::control::RejectCode::InvalidState, .. }
+    ), "unexpected cached-attach response: {response:?}");
+    let snapshot = ticket_handler.metrics().sessions;
+    assert_eq!(snapshot.sessions, 0);
+    assert_eq!(snapshot.paths, 0);
+    assert_eq!(snapshot.authenticated_connections, 0);
+}
+
+#[tokio::test]
+async fn distinct_jtis_reuse_only_the_matching_v2_session() {
     let pki = pki();
     let handler = handler();
     let listener = Arc::new(V2AdmissionListener::bind(
@@ -331,14 +587,14 @@ async fn distinct_jtis_reuse_only_the_matching_v2_owner() {
     for ticket in [FIXTURE_TICKET, FIXTURE_SECOND_TICKET] {
         let server_listener = Arc::clone(&listener);
         let server = tokio::spawn(async move {
-            server_listener.accept_one(AdmissionTime { unix_seconds: 1_000, monotonic_millis: 1 }).await
+            server_listener.accept_one_at(AdmissionTime { unix_seconds: 1_000, monotonic_millis: 1 }).await
         });
         let (_client, recv) = connect_and_send(address, &pki, hello(ticket, DeviceId::from_bytes([2; 16]))).await;
         let mut framed = ControlFramed::new(recv, ControlFrameLimit::default(), ControlDeadlines { read: TEST_TIMEOUT, write: TEST_TIMEOUT });
         assert!(matches!(framed.read_frame().await.unwrap().message, ControlMessage::SessionAdmit { .. }));
         assert!(timeout(TEST_TIMEOUT, server).await.unwrap().unwrap().is_ok());
     }
-    assert_eq!(handler.metrics().owners.entries, 1);
+    assert_eq!(handler.metrics().sessions.sessions, 1);
     assert_eq!(handler.metrics().admitted, 2);
     let conflicting_listener = V2AdmissionListener::bind(
         "127.0.0.1:0".parse().unwrap(),
@@ -354,7 +610,7 @@ async fn distinct_jtis_reuse_only_the_matching_v2_owner() {
     .unwrap();
     let conflicting_address = conflicting_listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        conflicting_listener.accept_one(AdmissionTime { unix_seconds: 1_000, monotonic_millis: 1 }).await
+        conflicting_listener.accept_one_at(AdmissionTime { unix_seconds: 1_000, monotonic_millis: 1 }).await
     });
     let (client, _recv) = connect_and_send(
         conflicting_address,
@@ -364,12 +620,11 @@ async fn distinct_jtis_reuse_only_the_matching_v2_owner() {
     .await;
     assert!(timeout(TEST_TIMEOUT, client.closed()).await.is_ok());
     assert!(timeout(TEST_TIMEOUT, server).await.unwrap().unwrap().is_err());
-    assert_eq!(handler.metrics().owners.entries, 1);
-    assert_eq!(handler.metrics().owners.owner_rejected, 1);
+    assert_eq!(handler.metrics().sessions.sessions, 1);
 }
 
 #[tokio::test]
-async fn identity_and_ticket_rejections_never_allocate_an_owner() {
+async fn identity_and_ticket_rejections_never_allocate_a_session() {
     let identity_pki = pki();
     let identity_handler = handler();
     let listener = Arc::new(V2AdmissionListener::bind(
@@ -387,12 +642,12 @@ async fn identity_and_ticket_rejections_never_allocate_an_owner() {
     let address = listener.local_addr().unwrap();
     let server_listener = Arc::clone(&listener);
     let server = tokio::spawn(async move {
-        server_listener.accept_one(AdmissionTime { unix_seconds: 1_000, monotonic_millis: 1 }).await
+        server_listener.accept_one_at(AdmissionTime { unix_seconds: 1_000, monotonic_millis: 1 }).await
     });
     let (client, _recv) = connect_and_send(address, &identity_pki, hello(FIXTURE_TICKET, DeviceId::from_bytes([2; 16]))).await;
     assert!(timeout(TEST_TIMEOUT, client.closed()).await.is_ok());
     assert!(timeout(TEST_TIMEOUT, server).await.unwrap().unwrap().is_err());
-    assert_eq!(identity_handler.metrics().owners.entries, 0);
+    assert_eq!(identity_handler.metrics().sessions.sessions, 0);
 
     let ticket_pki = pki();
     let ticket_handler = handler();
@@ -410,16 +665,16 @@ async fn identity_and_ticket_rejections_never_allocate_an_owner() {
     .unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        listener.accept_one(AdmissionTime { unix_seconds: 1_000, monotonic_millis: 1 }).await
+        listener.accept_one_at(AdmissionTime { unix_seconds: 1_000, monotonic_millis: 1 }).await
     });
     let (client, _recv) = connect_and_send(address, &ticket_pki, hello("not-a-ticket", DeviceId::from_bytes([2; 16]))).await;
     assert!(timeout(TEST_TIMEOUT, client.closed()).await.is_ok());
     assert!(timeout(TEST_TIMEOUT, server).await.unwrap().unwrap().is_err());
-    assert_eq!(ticket_handler.metrics().owners.entries, 0);
+    assert_eq!(ticket_handler.metrics().sessions.sessions, 0);
 }
 
 #[tokio::test]
-async fn mtls_rejection_never_allocates_an_owner() {
+async fn mtls_rejection_never_allocates_a_session() {
     let pki = pki();
     let handler = handler();
     let listener = V2AdmissionListener::bind(
@@ -436,7 +691,7 @@ async fn mtls_rejection_never_allocates_an_owner() {
     .unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        listener.accept_one(AdmissionTime { unix_seconds: 1_000, monotonic_millis: 1 }).await
+        listener.accept_one_at(AdmissionTime { unix_seconds: 1_000, monotonic_millis: 1 }).await
     });
     let no_identity = TestCredential {
         device_id: DeviceId::from_bytes([2; 16]),
@@ -452,5 +707,5 @@ async fn mtls_rejection_never_allocates_an_owner() {
         assert!(timeout(TEST_TIMEOUT, connection.closed()).await.is_ok());
     }
     assert!(timeout(TEST_TIMEOUT, server).await.unwrap().unwrap().is_err());
-    assert_eq!(handler.metrics().owners.entries, 0);
+    assert_eq!(handler.metrics().sessions.sessions, 0);
 }

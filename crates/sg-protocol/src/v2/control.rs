@@ -131,6 +131,7 @@ pub enum ControlMessage {
         session_id: SessionId,
         path_nonce: [u8; 16],
         path_epoch: u64,
+        key_epoch: u32,
         metadata: Bytes,
     },
     PathAttached {
@@ -347,15 +348,20 @@ fn encode_message(message: &ControlMessage) -> Result<(u8, Bytes), ControlCodecE
             session_id,
             path_nonce,
             path_epoch,
+            key_epoch,
             metadata,
         } => {
             validate_session(session_id)?;
             validate_id(path_nonce, "path nonce")?;
             validate_epoch(*path_epoch, "path epoch")?;
+            if *key_epoch == 0 {
+                return Err(ControlCodecError::InvalidField("key epoch"));
+            }
             validate_len("path metadata", metadata.len(), MAX_PATH_METADATA_LEN)?;
             body.extend_from_slice(session_id.as_bytes());
             body.extend_from_slice(path_nonce);
             body.extend_from_slice(&path_epoch.to_be_bytes());
+            body.extend_from_slice(&key_epoch.to_be_bytes());
             body.extend_from_slice(&(metadata.len() as u16).to_be_bytes());
             body.extend_from_slice(metadata);
             3
@@ -487,12 +493,17 @@ fn decode_message(kind: u8, body: &[u8]) -> Result<ControlMessage, ControlCodecE
             let session = reader.id("session ID")?;
             let nonce = reader.id("path nonce")?;
             let path_epoch = reader.epoch("path epoch")?;
+            let key_epoch = reader.u32()?;
+            if key_epoch == 0 {
+                return Err(ControlCodecError::InvalidField("key epoch"));
+            }
             let metadata = reader.bytes_u16("path metadata", MAX_PATH_METADATA_LEN)?;
             reader.finish()?;
             Ok(ControlMessage::PathAttach {
                 session_id: SessionId::from_bytes(session),
                 path_nonce: nonce,
                 path_epoch,
+                key_epoch,
                 metadata: Bytes::copy_from_slice(metadata),
             })
         }
@@ -770,6 +781,7 @@ mod tests {
                     session_id: session(),
                     path_nonce: [0x33; 16],
                     path_epoch: 4,
+                    key_epoch: 5,
                     metadata: Bytes::from_static(b"wifi"),
                 },
             },

@@ -194,7 +194,7 @@ pub struct PostAdmissionBinding {
     pub session_id: SessionId,
     pub device_id: DeviceId,
     pub path_id: PathId,
-    pub path_epoch: u32,
+    pub path_epoch: u64,
     pub key_epoch: u32,
     pub direction: Direction,
 }
@@ -540,7 +540,7 @@ impl ScriptedGateway {
     ) -> Result<(), ControlExpectationError> {
         if peer.direction != Direction::GatewayToClient
             || transaction_id == 0
-            || path_epoch != u64::from(peer.path_epoch)
+            || path_epoch != peer.path_epoch
             || self.bindings.get(&peer.connection_id).is_none_or(|binding| binding.binding != peer)
         {
             return Err(ControlExpectationError::UnboundOrInvalid);
@@ -698,7 +698,7 @@ fn validate_control(
         } if binding.direction == Direction::ClientToGateway
             && *session_id == binding.session_id
             && *path_id == binding.path_id
-            && *path_epoch == u64::from(binding.path_epoch) => Ok(()),
+            && *path_epoch == binding.path_epoch => Ok(()),
         ControlMessage::PathAttached { .. } => Err(ControlDropReason::UncorrelatedPathAttached),
         ControlMessage::PolicyUpdate { .. } if binding.direction != Direction::GatewayToClient => {
             Err(ControlDropReason::InvalidDirection)

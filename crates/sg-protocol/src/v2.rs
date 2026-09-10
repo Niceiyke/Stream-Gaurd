@@ -12,7 +12,7 @@ use thiserror::Error;
 pub const VERSION: u8 = 0x02;
 
 /// Bytes in the fixed V2 datagram header.
-pub const FIXED_HEADER_LEN: usize = 48;
+pub const FIXED_HEADER_LEN: usize = 52;
 
 /// Direction prevents packet identity reuse across the two tunnel directions.
 #[repr(u8)]
@@ -34,7 +34,7 @@ pub struct V2Header {
     pub direction: Direction,
     pub session_id: SessionId,
     pub path_id: PathId,
-    pub path_epoch: u32,
+    pub path_epoch: u64,
     pub key_epoch: u32,
     pub flow_id: FlowId,
     pub packet_id: PacketId,
@@ -153,11 +153,11 @@ impl V2Envelope {
         let mut session_id = [0; 16];
         session_id.copy_from_slice(&datagram[4..20]);
         let path_id = PathId::new(u16::from_be_bytes([datagram[20], datagram[21]]));
-        let path_epoch = u32::from_be_bytes(datagram[22..26].try_into().unwrap());
-        let key_epoch = u32::from_be_bytes(datagram[26..30].try_into().unwrap());
-        let flow_id = FlowId::new(u64::from_be_bytes(datagram[30..38].try_into().unwrap()));
-        let packet_id = PacketId::new(u64::from_be_bytes(datagram[38..46].try_into().unwrap()));
-        let payload_len = u16::from_be_bytes([datagram[46], datagram[47]]) as usize;
+        let path_epoch = u64::from_be_bytes(datagram[22..30].try_into().unwrap());
+        let key_epoch = u32::from_be_bytes(datagram[30..34].try_into().unwrap());
+        let flow_id = FlowId::new(u64::from_be_bytes(datagram[34..42].try_into().unwrap()));
+        let packet_id = PacketId::new(u64::from_be_bytes(datagram[42..50].try_into().unwrap()));
+        let payload_len = u16::from_be_bytes([datagram[50], datagram[51]]) as usize;
         let actual_payload_len = datagram.len() - FIXED_HEADER_LEN;
 
         validate_header(V2Header {
@@ -284,11 +284,26 @@ mod tests {
             &[
                 0x02, 0x00, 0x00, 0x01, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
                 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x12, 0x34, 0x00, 0x00,
-                0x00, 0x07, 0x00, 0x00, 0x00, 0x09, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-                0x07, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x00, 0x03,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x09, 0x01, 0x02,
+                0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+                0x17, 0x18, 0x00, 0x03,
                 b'a', b'b', b'c',
             ]
         );
+    }
+
+    #[test]
+    fn path_epoch_preserves_all_64_bits_on_the_wire() {
+        let mut header = header(TrafficClass::Realtime, Direction::ClientToGateway);
+        header.path_epoch = 0x0102_0304_0506_0708;
+        let envelope = V2Envelope {
+            header,
+            payload: Bytes::from_static(b"epoch"),
+        };
+
+        let wire = envelope.encode(LIMIT).unwrap();
+        assert_eq!(&wire[22..30], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(V2Envelope::decode(wire, LIMIT).unwrap(), envelope);
     }
 
     #[test]
@@ -317,13 +332,13 @@ mod tests {
         }
 
         let mut zero_path_epoch = valid.to_vec();
-        zero_path_epoch[22..26].fill(0);
+        zero_path_epoch[22..30].fill(0);
         assert_eq!(
             V2Envelope::decode(Bytes::from(zero_path_epoch), LIMIT),
             Err(V2EnvelopeError::ZeroPathEpoch)
         );
         let mut zero_key_epoch = valid.to_vec();
-        zero_key_epoch[26..30].fill(0);
+        zero_key_epoch[30..34].fill(0);
         assert_eq!(
             V2Envelope::decode(Bytes::from(zero_key_epoch), LIMIT),
             Err(V2EnvelopeError::ZeroKeyEpoch)

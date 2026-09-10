@@ -899,6 +899,7 @@ mod tests {
                 session_id: SESSION,
                 path_nonce: [nonce; 16],
                 path_epoch: epoch,
+                key_epoch: 1,
                 metadata: Bytes::from_static(b"wifi"),
             },
         }

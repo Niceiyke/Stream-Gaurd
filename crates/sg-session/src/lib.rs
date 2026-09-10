@@ -22,6 +22,10 @@ use sg_multipath::{Decision, ReorderBuffer, Sequencer, WeightedBondingScheduler}
 use sg_protocol::Envelope;
 use sg_transport::PathTransport;
 
+/// Production V2 lifecycle state is isolated from the experimental V1 session
+/// and its session-global reorder queue.
+pub mod v2;
+
 /// Builds a wire-safe session id from a 32-bit prefix (see module docs).
 ///
 /// The envelope puts `bytes[0..4]` of the uuid on the wire and the decoder

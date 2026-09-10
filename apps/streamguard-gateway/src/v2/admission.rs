@@ -1,8 +1,8 @@
-//! Bounded V2 ticket admission and minimal owner registry.
+//! Bounded V2 ticket admission backed by the authoritative session map.
 //!
 //! This module has no V1 session, path, TUN, payload, or flow dependency.
-//! WP-202 owns the real V2 session/path lifecycle; this registry only proves
-//! that no owner is allocated before mTLS and ticket admission succeed.
+//! WP-202 owns the real V2 session/path lifecycle; this module verifies tickets
+//! and reserves admission without allocating packet, path, TUN, or flow state.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -15,9 +15,12 @@ use sg_auth::ticket::{
     ControllerTrustSnapshot, OrganizationId, REPLAY_EXPIRY_SKEW_SECONDS, TicketId,
     TicketVerificationError, VerifiedAdmissionTicket,
 };
-use sg_core::v2::{DeviceId, SessionId};
+use sg_core::v2::{DeviceId, PathId, SessionId};
 use sg_protocol::v2::control::{AdmissionTicket, ControlMessage, MAX_GATEWAY_NAME_LEN};
 use thiserror::Error;
+
+use super::session_manager::{AdmissionReservation, AuthenticatedConnection, GatewayAttachReservation, V2SessionManager, V2SessionManagerError, V2SessionManagerSnapshot};
+use sg_session::v2::PathBinding;
 
 /// A decoded V2 `ClientHello` accepted only after the bounded control codec.
 #[derive(Clone)]
@@ -57,8 +60,12 @@ impl fmt::Debug for BoundedClientHello {
     }
 }
 
-/// Gateway-loop time is supplied by the caller so resource policy is
-/// deterministic and admission never needs a timer task.
+/// Gateway admission time in two independent domains. `monotonic_millis`
+/// drives TTL-based resource policy (handshake budgets, replay skew); the
+/// session manager's monotonic deadline is derived from it. `unix_seconds`
+/// is real wall time since the Unix epoch and is the only value compared
+/// against ticket claims. Production callers derive this from the lifecycle
+/// [`Clock`](super::session_manager::Clock); tests inject it directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdmissionTime {
     pub unix_seconds: u64,
@@ -114,106 +121,13 @@ impl fmt::Debug for SessionOwner {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AdmissionOwnerRegistryConfig {
-    pub capacity: usize,
-    pub ttl_seconds: u64,
-}
-
-/// The intentionally narrow pre-WP-202 owner registry. Entries are bounded
-/// and expire; a later ticket may only reuse a full session ID for the exact
-/// same device and organization. It has no paths or packet state.
-pub struct AdmissionOwnerRegistry {
-    config: AdmissionOwnerRegistryConfig,
-    entries: Mutex<HashMap<SessionId, OwnerEntry>>,
-    capacity_rejected: AtomicU64,
-    owner_rejected: AtomicU64,
-    expired: AtomicU64,
-}
-
-struct OwnerEntry {
-    owner: SessionOwner,
-    expires_at_unix_seconds: u64,
-}
-
-impl AdmissionOwnerRegistry {
-    pub fn new(config: AdmissionOwnerRegistryConfig) -> Result<Self, AdmissionError> {
-        if config.capacity == 0 || config.ttl_seconds == 0 {
-            return Err(AdmissionError::InvalidConfiguration);
-        }
-        Ok(Self {
-            config,
-            entries: Mutex::new(HashMap::new()),
-            capacity_rejected: AtomicU64::new(0),
-            owner_rejected: AtomicU64::new(0),
-            expired: AtomicU64::new(0),
-        })
-    }
-
-    fn provision(
-        &self,
-        owner: SessionOwner,
-        ticket: &VerifiedAdmissionTicket,
-        now_unix_seconds: u64,
-    ) -> Result<(), AdmissionProvisioningError> {
-        let mut entries = self.entries.lock().map_err(|_| AdmissionProvisioningError::Unavailable)?;
-        let before = entries.len();
-        entries.retain(|_, entry| entry.expires_at_unix_seconds > now_unix_seconds);
-        self.expired.fetch_add((before - entries.len()) as u64, Ordering::Relaxed);
-
-        let expires_at_unix_seconds = ticket
-            .expires_at_unix_seconds()
-            .min(now_unix_seconds.saturating_add(self.config.ttl_seconds));
-        if let Some(entry) = entries.get_mut(&owner.session_id()) {
-            if entry.owner != owner {
-                self.owner_rejected.fetch_add(1, Ordering::Relaxed);
-                return Err(AdmissionProvisioningError::OwnerRejected);
-            }
-            entry.expires_at_unix_seconds = entry.expires_at_unix_seconds.max(expires_at_unix_seconds);
-            return Ok(());
-        }
-        if entries.len() >= self.config.capacity {
-            self.capacity_rejected.fetch_add(1, Ordering::Relaxed);
-            return Err(AdmissionProvisioningError::Capacity);
-        }
-        entries.insert(owner.session_id(), OwnerEntry { owner, expires_at_unix_seconds });
-        Ok(())
-    }
-
-    #[must_use]
-    pub fn snapshot(&self) -> AdmissionOwnerRegistrySnapshot {
-        let entries = self.entries.lock().map(|entries| entries.len()).unwrap_or(0);
-        AdmissionOwnerRegistrySnapshot {
-            entries,
-            capacity: self.config.capacity,
-            capacity_rejected: self.capacity_rejected.load(Ordering::Relaxed),
-            owner_rejected: self.owner_rejected.load(Ordering::Relaxed),
-            expired: self.expired.load(Ordering::Relaxed),
-        }
-    }
-}
-
-impl fmt::Debug for AdmissionOwnerRegistry {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("AdmissionOwnerRegistry(REDACTED)")
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AdmissionOwnerRegistrySnapshot {
-    pub entries: usize,
-    pub capacity: usize,
-    pub capacity_rejected: u64,
-    pub owner_rejected: u64,
-    pub expired: u64,
-}
-
 /// Successful verification data used by the listener's SessionAdmit builder.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AdmissionAccepted {
     owner: SessionOwner,
     expires_at_unix_seconds: u64,
     policy_version: u64,
+    reservation: AdmissionReservation,
 }
 
 impl AdmissionAccepted {
@@ -230,6 +144,10 @@ impl AdmissionAccepted {
     #[must_use]
     pub fn policy_version(&self) -> u64 {
         self.policy_version
+    }
+
+    fn reservation(&self) -> AdmissionReservation {
+        self.reservation
     }
 }
 
@@ -498,7 +416,7 @@ pub struct AdmissionMetricsSnapshot {
     pub provisioning_rejected: u64,
     pub replay: ReplayCacheSnapshot,
     pub limiter: HandshakeAdmissionLimiterSnapshot,
-    pub owners: AdmissionOwnerRegistrySnapshot,
+    pub sessions: V2SessionManagerSnapshot,
 }
 
 /// Ticket admission is deliberately crate-private. The only public ingress is
@@ -507,7 +425,7 @@ pub struct AdmissionHandler<V> {
     validator: V,
     limiter: HandshakeAdmissionLimiter,
     replay_cache: ReplayCache,
-    owners: AdmissionOwnerRegistry,
+    sessions: Arc<V2SessionManager>,
     metrics: AdmissionMetrics,
 }
 
@@ -516,9 +434,9 @@ impl<V: AdmissionTicketValidator> AdmissionHandler<V> {
         validator: V,
         limiter: HandshakeAdmissionLimiter,
         replay_cache: ReplayCache,
-        owners: AdmissionOwnerRegistry,
+        sessions: Arc<V2SessionManager>,
     ) -> Self {
-        Self { validator, limiter, replay_cache, owners, metrics: AdmissionMetrics::default() }
+        Self { validator, limiter, replay_cache, sessions, metrics: AdmissionMetrics::default() }
     }
 
     #[must_use]
@@ -531,7 +449,7 @@ impl<V: AdmissionTicketValidator> AdmissionHandler<V> {
             provisioning_rejected: self.metrics.provisioning_rejected.load(Ordering::Relaxed),
             replay: self.replay_cache.snapshot(),
             limiter: self.limiter.snapshot(),
-            owners: self.owners.snapshot(),
+            sessions: self.sessions.snapshot(),
         }
     }
 
@@ -586,7 +504,19 @@ impl<V: AdmissionTicketValidator> AdmissionHandler<V> {
                 ReplayCacheError::Unavailable => AdmissionError::Unavailable,
             })?;
         let owner = SessionOwner::from_ticket(&ticket);
-        self.owners.provision(owner, &ticket, now.unix_seconds).map_err(|_| {
+        let expires_at_monotonic_ms = now
+            .monotonic_millis
+            .saturating_add(ticket.expires_at_unix_seconds().saturating_sub(now.unix_seconds).saturating_mul(1_000));
+        let reservation = self
+            .sessions
+            .reserve_admission(
+                owner.session_id(),
+                owner.device_id(),
+                owner.organization_id(),
+                expires_at_monotonic_ms,
+                now.monotonic_millis,
+            )
+            .map_err(|_| {
             self.metrics.provisioning_rejected.fetch_add(1, Ordering::Relaxed);
             AdmissionError::ProvisioningRejected
         })?;
@@ -595,7 +525,79 @@ impl<V: AdmissionTicketValidator> AdmissionHandler<V> {
             owner,
             expires_at_unix_seconds: ticket.expires_at_unix_seconds(),
             policy_version: ticket.policy_version(),
+            reservation,
         })
+    }
+
+    pub(super) fn commit_and_bind(
+        &self,
+        admitted: AdmissionAccepted,
+        now: AdmissionTime,
+    ) -> Result<AuthenticatedConnection, AdmissionError> {
+        self.sessions
+            .commit_admission_and_bind(admitted.reservation(), now.monotonic_millis)
+            .map_err(|_| AdmissionError::ProvisioningRejected)
+    }
+
+    pub(super) fn abort(&self, admitted: AdmissionAccepted) {
+        let _ = self.sessions.abort_admission(admitted.reservation());
+    }
+
+    pub(super) fn sweep(&self, now_ms: u64) -> Result<usize, V2SessionManagerError> {
+        self.sessions.sweep(now_ms)
+    }
+
+    pub(super) fn reserve_attach(
+        &self,
+        connection: AuthenticatedConnection,
+        path_epoch: u64,
+        key_epoch: u32,
+        now_ms: u64,
+    ) -> Result<GatewayAttachReservation, V2SessionManagerError> {
+        self.sessions.reserve_attach(connection, path_epoch, key_epoch, now_ms)
+    }
+
+    pub(super) fn commit_attach(
+        &self,
+        reservation: GatewayAttachReservation,
+    ) -> Result<PathBinding, V2SessionManagerError> {
+        self.sessions.commit_attach(reservation)
+    }
+
+    pub(super) fn detach_connection(
+        &self,
+        connection: AuthenticatedConnection,
+        path_id: PathId,
+        path_epoch: u64,
+        now_ms: u64,
+    ) -> Result<bool, V2SessionManagerError> {
+        self.sessions.detach_connection(connection, path_id, path_epoch, now_ms)
+    }
+
+    pub(super) fn validate_attached_path(
+        &self,
+        connection: AuthenticatedConnection,
+        path_id: PathId,
+        path_epoch: u64,
+        key_epoch: u32,
+        now_ms: u64,
+    ) -> Result<(), V2SessionManagerError> {
+        self.sessions
+            .validate_attached_path(connection, path_id, path_epoch, key_epoch, now_ms)
+    }
+
+    pub(super) fn close_connection(
+        &self,
+        connection: AuthenticatedConnection,
+    ) -> Result<bool, V2SessionManagerError> {
+        self.sessions.close_connection(connection)
+    }
+
+    pub(super) fn close_session(
+        &self,
+        connection: AuthenticatedConnection,
+    ) -> Result<bool, V2SessionManagerError> {
+        self.sessions.close_session(connection)
     }
 }
 

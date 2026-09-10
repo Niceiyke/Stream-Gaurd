@@ -12,6 +12,7 @@ sg-core.workspace = true
 sg-multipath.workspace = true
 sg-protocol.workspace = true
 sg-transport.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
