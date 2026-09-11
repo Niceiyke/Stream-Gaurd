@@ -872,7 +872,7 @@ impl PacketIdSequencer {
 /// checked pipeline previewed for this send. The pipeline validates the built
 /// envelope carries [`PacketReservation::id`] and rejects (without commit) any
 /// envelope that substitutes a different ID.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct PacketReservation {
     id: PacketId,
 }
