@@ -6,6 +6,15 @@
 //! tunnel milestone; this crate currently defines the seam that must stay
 //! behind `sg-transport` so the scheduler never touches UDP directly.
 
+/// V2-only checked path MTU, effective payload calculation, and whole-datagram
+/// send admission (WP-302; see also the [`mtu`] module docs).
+///
+/// Separates MTU admission from V1 quinn code. The admission gate validates
+/// the **whole datagram** (52-byte fixed header + payload) against the
+/// transport's advertised limit **before** packet-ID/counter commit and before
+/// transport send, with no 1200-byte fallback anywhere in the V2 chain.
+pub mod mtu;
+
 /// V2 reliable-control framing over a caller-provided byte stream. This seam
 /// deliberately does not create or open Quinn streams; WP-600 owns that work.
 pub mod v2;

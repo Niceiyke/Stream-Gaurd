@@ -22,6 +22,7 @@ use sg_protocol::control::ControlMsg;
 use sg_protocol::{Envelope, PacketType};
 
 use crate::{PathTransport, SessionTicket, async_trait};
+use crate::mtu::{CheckedSendPermit, DatagramMtu, DatagramSendError, DatagramSender};
 
 /// Builds the gateway's TLS/QUIC server configuration.
 pub fn server_tls(cert_der: &[u8], key_der: &[u8]) -> Result<quinn::ServerConfig> {
@@ -543,6 +544,71 @@ impl QuicSession {
     }
 }
 
+/// Maps Quinn's concrete (or missing) whole-datagram limit to a V2
+/// [`DatagramMtu`] **without any fallback**.
+///
+/// `None` (datagrams disabled locally, unsupported by the peer, or not yet
+/// negotiated) propagates as `None`: V2 admission stays denied until the
+/// transport supplies a concrete limit. V1's `QuicPathTransport` keeps its
+/// historical `unwrap_or(1200)`; this V2 helper deliberately never synthesizes
+/// a limit.
+#[must_use]
+pub fn v2_checked_datagram_mtu(limit: Option<usize>) -> Option<DatagramMtu> {
+    limit.and_then(|limit| DatagramMtu::new(limit).ok())
+}
+
+/// V2-only whole-datagram sender over one authenticated quinn connection.
+///
+/// Deliberately distinct from the V1 [`QuicPathTransport`]: it participates in
+/// the V2 [`DatagramSender`] seam, reports the transport's actual
+/// whole-datagram limit (never a fabricated 1200-byte fallback), and maps
+/// quinn's send failures to typed [`DatagramSendError`]s so the V2 scheduler
+/// can classify a rejection without inspecting packet content.
+///
+/// There is no public bypass: transmitting requires a [`CheckedSendPermit`]
+/// that only [`crate::mtu::CheckedDatagramSender::send_checked`] can
+/// construct. Public callers can wrap this handle in the checked sender and
+/// query the MTU, but cannot send a raw datagram around admission.
+pub struct V2QuicDatagramSender {
+    conn: quinn::Connection,
+}
+
+impl V2QuicDatagramSender {
+    /// Wraps an authenticated quinn connection.
+    #[must_use]
+    pub fn new(conn: quinn::Connection) -> Self {
+        Self { conn }
+    }
+}
+
+#[async_trait]
+impl DatagramSender for V2QuicDatagramSender {
+    async fn send_datagram(
+        &self,
+        datagram: Bytes,
+        _permit: CheckedSendPermit,
+    ) -> std::result::Result<(), DatagramSendError> {
+        let datagram_len = datagram.len();
+        self.conn.send_datagram(datagram).map_err(|error| match error {
+            quinn::SendDatagramError::TooLarge => DatagramSendError::TooLarge {
+                datagram_len,
+                limit: self.conn.max_datagram_size().unwrap_or(0),
+            },
+            quinn::SendDatagramError::UnsupportedByPeer | quinn::SendDatagramError::Disabled => {
+                // No fallback: an unusable datagram path stays unusable.
+                DatagramSendError::Rejected("datagram support is disabled by transport or peer".into())
+            }
+            quinn::SendDatagramError::ConnectionLost(_) => {
+                DatagramSendError::Rejected("datagram connection lost".into())
+            }
+        })
+    }
+
+    fn current_datagram_mtu(&self) -> Option<DatagramMtu> {
+        v2_checked_datagram_mtu(self.conn.max_datagram_size())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1043,5 +1109,156 @@ mod tests {
             server_task.await.unwrap(),
             Err(DeviceCredentialError::PeerIdentityMismatch)
         );
+    }
+
+    #[test]
+    fn v2_checked_datagram_mtu_maps_without_fallback() {
+        use crate::mtu::{MAX_DATAGRAM_MTU, SAFE_MODE_MIN_DATAGRAM_MTU};
+        use sg_protocol::v2::FIXED_HEADER_LEN;
+        // No negotiated limit (disabled/unsupported/not yet negotiated):
+        // propagates as None — never a synthesized 1200-byte limit.
+        assert_eq!(v2_checked_datagram_mtu(None), None);
+        // Sub-header and zero limits are not usable datagram MTUs.
+        assert_eq!(v2_checked_datagram_mtu(Some(0)), None);
+        assert_eq!(v2_checked_datagram_mtu(Some(FIXED_HEADER_LEN - 1)), None);
+        // Exactly the fixed header is degenerate but valid.
+        assert_eq!(
+            v2_checked_datagram_mtu(Some(FIXED_HEADER_LEN)),
+            DatagramMtu::new(FIXED_HEADER_LEN).ok()
+        );
+        // A real Safe-Mode limit maps 1:1.
+        assert_eq!(
+            v2_checked_datagram_mtu(Some(SAFE_MODE_MIN_DATAGRAM_MTU)),
+            DatagramMtu::new(SAFE_MODE_MIN_DATAGRAM_MTU).ok()
+        );
+        // Above the hard maximum is rejected, not truncated.
+        assert_eq!(v2_checked_datagram_mtu(Some(MAX_DATAGRAM_MTU + 1)), None);
+    }
+
+    #[tokio::test]
+    async fn v2_checked_datagram_sender_admits_whole_datagrams_over_loopback() {
+        use crate::mtu::{
+            CheckedDatagramSender, CheckedSendError, MtuAdmission, MtuRejectReason,
+            PacketIdSequencer,
+        };
+        use sg_core::v2::{
+            FlowId as V2FlowId, PacketId as V2PacketId, PathId as V2PathId,
+            SessionId as V2SessionId, TrafficClass,
+        };
+        use sg_protocol::v2::{Direction, V2Envelope, V2Header};
+
+        let (cert_der, key_der) = test_cert();
+        let server_cfg = server_tls(&cert_der, &key_der).unwrap();
+        let client_cfg = client_tls(&cert_der).unwrap();
+
+        let server_endpoint =
+            quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server_endpoint.local_addr().unwrap();
+        // Server: read exactly one datagram, then assert a bounded second read
+        // times out (a gate-rejected envelope must never reach the wire).
+        let server_task: JoinHandle<(usize, bool)> = tokio::spawn(async move {
+            let incoming = server_endpoint.accept().await.unwrap();
+            let conn = tokio::time::timeout(TEST_TLS_TIMEOUT, incoming)
+                .await
+                .unwrap()
+                .unwrap();
+            let first = tokio::time::timeout(TEST_TLS_TIMEOUT, conn.read_datagram())
+                .await
+                .unwrap()
+                .unwrap();
+            let second = tokio::time::timeout(Duration::from_millis(250), conn.read_datagram()).await;
+            (first.len(), second.is_err())
+        });
+
+        let mut client_endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+        client_endpoint.set_default_client_config(client_cfg);
+        let connecting = client_endpoint.connect(addr, "localhost").unwrap();
+        let client_conn =
+            tokio::time::timeout(TEST_TLS_TIMEOUT, connecting).await.unwrap().unwrap();
+
+        let inner = V2QuicDatagramSender::new(client_conn.clone());
+        let dm = inner
+            .current_datagram_mtu()
+            .expect("loopback negotiates a concrete whole-datagram limit");
+        let mut sender = CheckedDatagramSender::new(inner, MtuAdmission::default());
+
+        // Engine-owned sequencer: the pipeline previews (never advancing) and
+        // commits only after the transport enqueue succeeds. No caller
+        // supplied closure can advance or forge the preview.
+        let mut sequencer = PacketIdSequencer::new(41);
+
+        let full_payload = dm.effective_payload().get();
+        // Atomic pipeline: query transport MTU, admit, preview a reservation,
+        // build the envelope from the reservation, encode, send, commit.
+        let sent_id = sender
+            .send_checked(
+                full_payload,
+                &mut sequencer,
+                |reservation| V2Envelope {
+                    header: V2Header {
+                        traffic_class: TrafficClass::Realtime,
+                        direction: Direction::ClientToGateway,
+                        session_id: V2SessionId::from_bytes([9; 16]),
+                        path_id: V2PathId::new(1),
+                        path_epoch: 1,
+                        key_epoch: 1,
+                        flow_id: V2FlowId::new(1),
+                        packet_id: reservation.id(),
+                    },
+                    payload: Bytes::from(vec![0xCD; full_payload]),
+                },
+            )
+            .await
+            .expect("full-size datagram admitted");
+        assert_eq!(sent_id, V2PacketId::new(41), "sender returns the previewed/committed ID");
+        assert_eq!(sequencer.next_value(), 42, "commit advanced the counter by exactly 1");
+        assert_eq!(sender.admission().metrics().sends_admitted, 1);
+        assert_eq!(sender.admission().metrics().sends_enqueued, 1);
+        assert_eq!(sender.admission().metrics().sends_rejected, 0);
+        assert_eq!(sender.admission().metrics().encode_failures, 0);
+        assert_eq!(sender.admission().metrics().transport_failures, 0);
+
+        // One payload byte over the effective limit makes the whole datagram
+        // over the negotiated limit: rejected at the gate, never sent, and the
+        // sequencer is untouched (rejection precedes any preview).
+        let mut rejected_sequencer = PacketIdSequencer::new(42);
+        let error = sender
+            .send_checked(
+                full_payload + 1,
+                &mut rejected_sequencer,
+                |reservation| V2Envelope {
+                    header: V2Header {
+                        traffic_class: TrafficClass::Realtime,
+                        direction: Direction::ClientToGateway,
+                        session_id: V2SessionId::from_bytes([9; 16]),
+                        path_id: V2PathId::new(1),
+                        path_epoch: 1,
+                        key_epoch: 1,
+                        flow_id: V2FlowId::new(1),
+                        packet_id: reservation.id(),
+                    },
+                    payload: Bytes::from(vec![0xCD; full_payload + 1]),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CheckedSendError::Rejected(MtuRejectReason::DatagramExceedsMtu { .. })
+        ));
+        assert_eq!(rejected_sequencer.next_value(), 42, "counter unchanged after gate rejection");
+        assert_eq!(sequencer.next_value(), 42, "prior commit is unaffected by the later rejection");
+        assert_eq!(sender.admission().metrics().sends_admitted, 1);
+        assert_eq!(sender.admission().metrics().sends_enqueued, 1);
+        assert_eq!(sender.admission().metrics().sends_rejected, 1);
+        assert_eq!(sender.admission().metrics().encode_failures, 0);
+        assert_eq!(sender.admission().metrics().transport_failures, 0);
+
+        let (first_len, second_absent) =
+            tokio::time::timeout(TEST_TLS_TIMEOUT, server_task).await.unwrap().unwrap();
+        assert_eq!(first_len, dm.get(), "wire datagram is exactly the negotiated MTU");
+        assert!(second_absent, "over-limit envelope must never reach the transport");
+
+        client_conn.close(quinn::VarInt::from_u32(0), b"test done");
     }
 }

@@ -1,7 +1,8 @@
 ---
 description: V2 Rust implementation lead for StreamGuard. Builds one approved work packet at a time from REBUILD_V2_AGENT_PLAN.md, with secure multipath networking, bounded state, and verified delivery.
 mode: subagent
-model: opencode/big-pickle
+model: opencode/muse-spark-1.3-contributor-free
+variant: xhigh
 permission:
   task: allow
   todowrite: allow

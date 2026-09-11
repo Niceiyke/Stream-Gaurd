@@ -1030,6 +1030,36 @@ impl Netem {
         Ok(())
     }
 
+    /// Dynamically changes the datagram MTU for one direction of an existing
+    /// path mid-scenario. Used by WP-302 netem tests to simulate PMTUD
+    /// black-hole detection and recovery without removing/re-adding the path.
+    pub fn update_path_mtu(
+        &mut self,
+        path_id: PathId,
+        direction: Direction,
+        new_datagram_mtu: usize,
+    ) -> Result<(), UpdateMtuError> {
+        if new_datagram_mtu < sg_protocol::v2::FIXED_HEADER_LEN {
+            return Err(UpdateMtuError::MtuTooSmall {
+                mtu: new_datagram_mtu,
+                minimum: sg_protocol::v2::FIXED_HEADER_LEN,
+            });
+        }
+        let path = self
+            .paths
+            .get_mut(&path_id.get())
+            .ok_or(UpdateMtuError::PathNotFound(path_id))?;
+        match direction {
+            Direction::ClientToGateway => {
+                path.profile.client_to_gateway.datagram_mtu = new_datagram_mtu;
+            }
+            Direction::GatewayToClient => {
+                path.profile.gateway_to_client.datagram_mtu = new_datagram_mtu;
+            }
+        }
+        Ok(())
+    }
+
     /// Picks the lowest attached, non-failed path for deterministic harness
     /// tests only. This is not the V2 scheduler planned for WP-602.
     pub fn choose_lowest_healthy_path(&self, direction: Direction) -> Option<PathId> {
@@ -1386,6 +1416,15 @@ pub enum AddPathError {
     Capacity(QueueDropReason),
     CapacityExceeded,
     Clock(ClockError),
+}
+
+/// Why a dynamic MTU update failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateMtuError {
+    /// The requested MTU is smaller than the V2 fixed header.
+    MtuTooSmall { mtu: usize, minimum: usize },
+    /// The path does not exist in the harness.
+    PathNotFound(PathId),
 }
 
 #[derive(Debug)]

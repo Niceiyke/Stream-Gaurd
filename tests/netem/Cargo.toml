@@ -11,3 +11,4 @@ description = "Deterministic V2 post-admission network simulation harness"
 bytes.workspace = true
 sg-core.workspace = true
 sg-protocol.workspace = true
+sg-transport.workspace = true

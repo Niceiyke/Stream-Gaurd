@@ -1,10 +1,16 @@
-//! Minimal V2 client engine supervisor (REBUILD WP-300).
+//! Minimal V2 client engine supervisor (REBUILD WP-300/WP-302).
 //!
 //! Owns one [`DriverTun`] (the exclusive blocking TUN owner) and mirrors its
-//! durable terminal failure into a typed engine state. There is intentionally
-//! no V2 packet, scheduler, QUIC, or TUN-traffic wiring here: sequencing and
-//! forwarding arrive in later work packets (WP-301/WP-302, WP-600+). V1 client
-//! code (`client.rs`, `status.rs`, `ipc.rs`) is untouched.
+//! durable terminal failure into a typed engine state. Since WP-302 the engine
+//! also owns the V2 MTU admission gate ([`MtuAdmission`], derived at
+//! construction from the driver's actual advertised TUN config) so the future
+//! uplink can validate a payload **before** packet-ID/counter commit, plus the
+//! engine-owned packet-ID sequencer ([`PacketIdSequencer`]) whose counter the
+//! checked send pipeline previews (never advancing) and commits (only after a
+//! successful transport enqueue). There is intentionally no V2 packet, scheduler, QUIC send, or
+//! TUN-traffic wiring here yet: sequencing and forwarding arrive in later work
+//! packets (WP-301/WP-302 send path, WP-600+). V1 client code (`client.rs`,
+//! `status.rs`, `ipc.rs`) is untouched.
 //!
 //! Autonomous terminal notification (WP-300 final blocker): the driver publishes
 //! a single coalescing `watch` bool on its first failure (`send_replace`, so a
@@ -23,6 +29,10 @@
 //! bug and surfaces as a durable `JoinRequired` terminal failure on every cloned
 //! sender.
 
+use sg_transport::mtu::{
+    AdmissionResult, DatagramMtu, MtuAdmission, MtuEvent, MtuMetrics, MtuRejectReason,
+    PacketIdSequencer, PathMtuState,
+};
 use sg_tun::driver::{DriverError, DriverFailure, DriverMetrics, DriverSender, DriverTun};
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
@@ -39,11 +49,24 @@ pub enum V2ClientEngineState {
     Closed,
 }
 
-/// Minimal supervisor owning one V2 blocking TUN driver.
+/// Minimal supervisor owning one V2 blocking TUN driver and the V2 MTU
+/// admission gate.
 pub struct V2ClientEngine {
     driver: Option<DriverTun>,
     state: Arc<Mutex<V2ClientEngineState>>,
     watcher: Option<JoinHandle<()>>,
+    /// Engine-owned V2 MTU admission gate, derived from the driver's
+    /// advertised TUN config (WP-302).
+    mtu: MtuAdmission,
+    /// Engine-owned V2 packet-ID sequencer for the client→gateway send
+    /// direction (WP-302 preview-closure blocker). The first packet ID is 0;
+    /// the counter advances only inside
+    /// [`CheckedDatagramSender::send_checked`](sg_transport::mtu::CheckedDatagramSender::send_checked)
+    /// after a successful transport enqueue. There is no other advancing
+    /// path: handing `&mut` to the checked pipeline is the only way to move
+    /// the head. IDs never wrap: issuing `u64::MAX` terminates the sequencer
+    /// and the sender MUST rotate the key epoch to continue.
+    sequencer: PacketIdSequencer,
 }
 
 fn lock_state(state: &Arc<Mutex<V2ClientEngineState>>) -> std::sync::MutexGuard<'_, V2ClientEngineState> {
@@ -88,10 +111,32 @@ impl V2ClientEngine {
                 }
             })
         });
+        let mtu = Self::mtu_admission_from_driver(&driver);
         Self {
             driver: Some(driver),
             state,
             watcher,
+            mtu,
+            sequencer: PacketIdSequencer::new(0),
+        }
+    }
+
+    /// Builds the admission gate from the driver's **actual advertised TUN
+    /// config** (`backend.mtu()`, the safe-mode 1300 in production). The gate
+    /// is never a V1-style implicit constant: it reflects the real adapter
+    /// config the OS will generate packets at.
+    ///
+    /// A backend that reports an out-of-range MTU falls back to the safe-mode
+    /// default (1300) with a warning; the engine stays usable and the anomaly
+    /// is observable, never a crash.
+    fn mtu_admission_from_driver(driver: &DriverTun) -> MtuAdmission {
+        let backend_mtu = driver.backend_mtu() as usize;
+        match MtuAdmission::with_tun_payload_mtu(backend_mtu) {
+            Ok(admission) => admission,
+            Err(error) => {
+                tracing::warn!(backend_mtu, %error, "v2 TUN backend MTU out of range; falling back to safe-mode default");
+                MtuAdmission::default()
+            }
         }
     }
 
@@ -181,6 +226,94 @@ impl V2ClientEngine {
         self.driver.as_ref().map(|driver| driver.backend_mtu())
     }
 
+    /// Snapshot of the engine-owned MTU admission gate (state + counters).
+    /// Starts in `Unknown` with the safe-mode TUN payload policy; the path
+    /// supervisor drives it with the `on_mtu_*` methods (WP-302).
+    #[must_use]
+    pub fn mtu_admission(&self) -> MtuAdmission {
+        self.mtu
+    }
+
+    /// Current per-path MTU state (`Unknown` until the first discovery).
+    #[must_use]
+    pub fn mtu_state(&self) -> PathMtuState {
+        self.mtu.state()
+    }
+
+    /// MTU admission counters owned by the gate.
+    #[must_use]
+    pub fn mtu_metrics(&self) -> MtuMetrics {
+        self.mtu.metrics()
+    }
+
+    /// True while the current path can still carry a full TUN-sized payload.
+    /// Flipping to false after an MTU reduction is the typed failover signal
+    /// for the path supervisor (WP-302, WP-501).
+    #[must_use]
+    pub fn can_carry_tun_payload(&self) -> bool {
+        self.mtu.can_carry_tun_payload()
+    }
+
+    /// Admits a payload length at the engine-owned MTU gate. A rejection means
+    /// the caller MUST NOT sequence, deliver, or count the packet (WP-302).
+    /// Sequencing belongs to the checked send pipeline
+    /// (`CheckedDatagramSender::send_checked` with the engine-owned
+    /// [`PacketIdSequencer`]); this gate never allocates or commits a packet ID.
+    pub fn admit_payload(&mut self, payload_len: usize) -> Result<AdmissionResult, MtuRejectReason> {
+        self.mtu.admit_payload(payload_len)
+    }
+
+    /// Non-advancing peek at the next V2 packet ID for the client→gateway
+    /// send direction. Pure read: repeated calls return the same value until
+    /// the checked send pipeline commits a send. Public callers cannot
+    /// advance the preview through this seam. Once exhausted the value stays
+    /// at `u64::MAX` (the last issued ID); see [`Self::packet_id_exhausted`].
+    #[must_use]
+    pub fn packet_next_value(&self) -> u64 {
+        self.sequencer.next_value()
+    }
+
+    /// True once the engine-owned sequencer issued `u64::MAX`. Terminal: the
+    /// checked send pipeline fails fast with a typed exhaustion error before
+    /// any enqueue, the ID is never reused, and recovery requires rotating
+    /// the key epoch with a new sequencer.
+    #[must_use]
+    pub fn packet_id_exhausted(&self) -> bool {
+        self.sequencer.is_exhausted()
+    }
+
+    /// Exclusive access to the engine-owned packet-ID sequencer for the
+    /// checked send pipeline
+    /// ([`CheckedDatagramSender::send_checked`](sg_transport::mtu::CheckedDatagramSender::send_checked)).
+    /// The pipeline previews (never advancing) and commits (only after a
+    /// successful transport enqueue); preview and commit are private to
+    /// `sg-transport`, so this handle offers no other advancing path.
+    pub fn packet_sequencer_mut(&mut self) -> &mut PacketIdSequencer {
+        &mut self.sequencer
+    }
+
+    /// Records path MTU discovery on the selected path.
+    pub fn on_mtu_discovered(&mut self, mtu: DatagramMtu) -> MtuEvent {
+        self.mtu.discover(mtu)
+    }
+
+    /// Records a path MTU reduction report. Only strictly smaller values
+    /// replace the limit; equal/larger reports yield
+    /// [`MtuEvent::ReduceIgnored`] and never raise the path MTU.
+    pub fn on_mtu_reduced(&mut self, new_mtu: DatagramMtu) -> MtuEvent {
+        self.mtu.reduce(new_mtu)
+    }
+
+    /// Records a complete MTU black hole on the selected path.
+    pub fn on_mtu_blackhole(&mut self) -> MtuEvent {
+        self.mtu.blackhole()
+    }
+
+    /// Records MTU recovery (re-discovery) after a black hole.
+    pub fn on_mtu_recovered(&mut self, mtu: DatagramMtu) -> MtuEvent {
+        self.mtu.recover(mtu)
+    }
+
     /// Asks the owned driver worker to exit (flag + interrupt event, prompt
     /// wakeup). Idempotent and non-blocking; use [`V2ClientEngine::shutdown`]
     /// to join. A missing driver (after `shutdown`) is a no-op.
@@ -249,6 +382,7 @@ impl Drop for V2ClientEngine {
 mod tests {
     use super::*;
     use sg_tun::driver::{DriverConfig, FailureKind, InterruptTrigger, TunInterrupt};
+    use sg_transport::mtu::{SAFE_MODE_MIN_DATAGRAM_MTU, SAFE_MODE_MIN_PAYLOAD_MTU};
     use std::io;
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
@@ -265,6 +399,7 @@ mod tests {
 
     struct StubBackend {
         state: Arc<(Mutex<StubInner>, Condvar)>,
+        mtu: u32,
     }
 
     struct StubInterrupt {
@@ -288,6 +423,10 @@ mod tests {
     }
 
     fn stub_pair() -> (StubBackend, StubHandle) {
+        stub_pair_with_mtu(1_300)
+    }
+
+    fn stub_pair_with_mtu(mtu: u32) -> (StubBackend, StubHandle) {
         let state = Arc::new((
             Mutex::new(StubInner {
                 fail_read: false,
@@ -299,7 +438,7 @@ mod tests {
             Condvar::new(),
         ));
         (
-            StubBackend { state: Arc::clone(&state) },
+            StubBackend { state: Arc::clone(&state), mtu },
             StubHandle { state },
         )
     }
@@ -341,7 +480,7 @@ mod tests {
         }
 
         fn mtu(&self) -> u32 {
-            1_500
+            self.mtu
         }
 
         fn name(&self) -> &str {
@@ -406,7 +545,7 @@ mod tests {
         // must time out instead of resolving.
         assert!(tokio::time::timeout(Duration::from_millis(20), engine.await_terminal()).await.is_err());
         assert_eq!(engine.backend_name().as_deref(), Some("stub-tun"));
-        assert_eq!(engine.backend_mtu(), Some(1_500));
+        assert_eq!(engine.backend_mtu(), Some(1_300));
         assert!(engine.metrics().is_some());
         assert!(engine.sender().is_some());
         let state = engine.shutdown().await.unwrap();
@@ -529,5 +668,182 @@ mod tests {
             .expect("join-required notification deadline");
         assert_eq!(failure.kind(), FailureKind::JoinRequired);
         assert!(handle.interrupt_triggers() >= 1);
+    }
+
+    #[tokio::test]
+    async fn engine_mtu_admits_safe_mode_payload_at_safe_mode_datagram() {
+        let (backend, handle) = stub_pair();
+        let mut engine = V2ClientEngine::new(DriverTun::spawn(backend, engine_config()).unwrap());
+        assert_eq!(handle.wait_entered_read(1), 1);
+        // The gate starts Unknown: nothing is admissible until discovery.
+        assert_eq!(engine.mtu_state(), PathMtuState::Unknown);
+        assert!(!engine.can_carry_tun_payload());
+
+        let event =
+            engine.on_mtu_discovered(DatagramMtu::new(SAFE_MODE_MIN_DATAGRAM_MTU).unwrap());
+        assert_eq!(event, MtuEvent::MtuDiscovered { datagram_mtu: SAFE_MODE_MIN_DATAGRAM_MTU });
+        assert!(engine.can_carry_tun_payload());
+
+        // A 1300-byte payload in a 1352-byte datagram: admitted at the gate.
+        // The gate never allocates a packet ID or records an enqueue: IDs and
+        // `sends_enqueued` advance only in the checked send pipeline
+        // (`CheckedDatagramSender::send_checked` preview/commit).
+        assert!(engine.admit_payload(SAFE_MODE_MIN_PAYLOAD_MTU).is_ok());
+        assert_eq!(engine.mtu_metrics().sends_admitted, 1);
+        assert_eq!(engine.mtu_metrics().sends_enqueued, 0);
+        assert_eq!(engine.mtu_metrics().sends_rejected, 0);
+        assert_eq!(engine.mtu_metrics().encode_failures, 0);
+        assert_eq!(engine.mtu_metrics().transport_failures, 0);
+        let state = engine.shutdown().await.unwrap();
+        assert_eq!(state, V2ClientEngineState::Closed);
+    }
+
+    #[tokio::test]
+    async fn engine_mtu_rejection_counts_only_in_rejected_bucket() {
+        let (backend, handle) = stub_pair();
+        let mut engine = V2ClientEngine::new(DriverTun::spawn(backend, engine_config()).unwrap());
+        assert_eq!(handle.wait_entered_read(1), 1);
+        engine.on_mtu_discovered(DatagramMtu::new(SAFE_MODE_MIN_DATAGRAM_MTU).unwrap());
+
+        // Oversized at the safe-mode payload: rejected with the typed reason.
+        // The gate allocates no packet ID (there is no ID helper here) and
+        // records only a gate rejection — never an enqueue.
+        assert!(matches!(
+            engine.admit_payload(SAFE_MODE_MIN_PAYLOAD_MTU + 1),
+            Err(MtuRejectReason::PayloadExceedsMtu { .. })
+        ));
+        assert_eq!(engine.mtu_metrics().sends_admitted, 0);
+        assert_eq!(engine.mtu_metrics().sends_enqueued, 0);
+        assert_eq!(engine.mtu_metrics().sends_rejected, 1);
+
+        // A black-holed path rejects even tiny payloads the same way.
+        engine.on_mtu_blackhole();
+        assert_eq!(
+            engine.admit_payload(1),
+            Err(MtuRejectReason::PathMtuBlackHole)
+        );
+        assert_eq!(engine.mtu_metrics().sends_admitted, 0);
+        assert_eq!(engine.mtu_metrics().sends_enqueued, 0);
+        assert_eq!(engine.mtu_metrics().sends_rejected, 2);
+
+        let state = engine.shutdown().await.unwrap();
+        assert_eq!(state, V2ClientEngineState::Closed);
+    }
+
+    #[tokio::test]
+    async fn engine_mtu_reduction_degrades_then_fails_over_below_tun_payload() {
+        let (backend, handle) = stub_pair();
+        let mut engine = V2ClientEngine::new(DriverTun::spawn(backend, engine_config()).unwrap());
+        assert_eq!(handle.wait_entered_read(1), 1);
+        engine.on_mtu_discovered(DatagramMtu::new(1_500).unwrap());
+        assert!(engine.can_carry_tun_payload());
+        assert!(engine.admit_payload(SAFE_MODE_MIN_PAYLOAD_MTU).is_ok());
+
+        // 1352 still carries the 1300-byte TUN payload: degraded but usable.
+        engine.on_mtu_reduced(DatagramMtu::new(SAFE_MODE_MIN_DATAGRAM_MTU).unwrap());
+        assert!(engine.can_carry_tun_payload());
+        assert!(engine.admit_payload(SAFE_MODE_MIN_PAYLOAD_MTU).is_ok());
+        assert_eq!(engine.mtu_metrics().mtu_reductions, 1);
+
+        // Below the TUN payload the typed failover signal flips; a TUN-sized
+        // payload is rejected at the gate (WP-501 consumes this). The gate
+        // never allocates packet IDs, so there is no ID to leak.
+        engine.on_mtu_reduced(DatagramMtu::new(1_280).unwrap());
+        assert!(!engine.can_carry_tun_payload());
+        assert_eq!(engine.mtu_metrics().mtu_reductions, 2);
+        assert!(matches!(
+            engine.admit_payload(SAFE_MODE_MIN_PAYLOAD_MTU),
+            Err(MtuRejectReason::PayloadExceedsMtu { .. })
+        ));
+        assert_eq!(engine.mtu_metrics().sends_enqueued, 0);
+
+        let state = engine.shutdown().await.unwrap();
+        assert_eq!(state, V2ClientEngineState::Closed);
+    }
+
+    #[tokio::test]
+    async fn engine_mtu_reduce_never_raises_the_limit() {
+        let (backend, handle) = stub_pair();
+        let mut engine = V2ClientEngine::new(DriverTun::spawn(backend, engine_config()).unwrap());
+        assert_eq!(handle.wait_entered_read(1), 1);
+        engine.on_mtu_discovered(DatagramMtu::new(SAFE_MODE_MIN_DATAGRAM_MTU).unwrap());
+        assert_eq!(engine.mtu_metrics().mtu_reductions, 0);
+
+        let raised = engine.on_mtu_reduced(DatagramMtu::new(1_500).unwrap());
+        assert_eq!(
+            raised,
+            MtuEvent::ReduceIgnored { requested: 1_500, current: SAFE_MODE_MIN_DATAGRAM_MTU }
+        );
+        let equal = engine.on_mtu_reduced(DatagramMtu::new(SAFE_MODE_MIN_DATAGRAM_MTU).unwrap());
+        assert_eq!(
+            equal,
+            MtuEvent::ReduceIgnored {
+                requested: SAFE_MODE_MIN_DATAGRAM_MTU,
+                current: SAFE_MODE_MIN_DATAGRAM_MTU,
+            }
+        );
+        // State provably unchanged, so the counters never advanced.
+        assert_eq!(
+            engine.mtu_state(),
+            PathMtuState::Available {
+                datagram_mtu: DatagramMtu::new(SAFE_MODE_MIN_DATAGRAM_MTU).unwrap(),
+                effective: DatagramMtu::new(SAFE_MODE_MIN_DATAGRAM_MTU).unwrap().effective_payload(),
+            }
+        );
+        assert!(engine.can_carry_tun_payload());
+        assert_eq!(engine.mtu_metrics().mtu_reductions, 0);
+
+        let state = engine.shutdown().await.unwrap();
+        assert_eq!(state, V2ClientEngineState::Closed);
+    }
+
+    #[tokio::test]
+    async fn engine_mtu_gate_derives_from_actual_advertised_tun_config() {
+        // WP-302 final blocker: the admission gate is built from the driver's
+        // **actual advertised TUN config**, never a V1-style implicit constant.
+        // A 1500-byte TUN config creates a 1500-byte payload requirement, so
+        // the safe-mode 1352 datagram limit cannot carry a full TUN payload.
+        let (backend, handle) = stub_pair_with_mtu(1_500);
+        let mut engine = V2ClientEngine::new(DriverTun::spawn(backend, engine_config()).unwrap());
+        assert_eq!(handle.wait_entered_read(1), 1);
+        assert_eq!(engine.backend_mtu(), Some(1_500));
+        assert_eq!(engine.mtu_admission().tun_payload_mtu().get(), 1_500);
+
+        engine.on_mtu_discovered(DatagramMtu::new(SAFE_MODE_MIN_DATAGRAM_MTU).unwrap());
+        // 1300 effective < the 1500-byte configured TUN payload: the path
+        // cannot carry a full TUN frame and the typed failover signal flips.
+        assert!(!engine.can_carry_tun_payload());
+        let state = engine.shutdown().await.unwrap();
+        assert_eq!(state, V2ClientEngineState::Closed);
+
+        // The safe-mode default MTU (1300) still carries its own frame: with
+        // the production config the gate is exactly safe-mode behavior.
+        let (backend, handle) = stub_pair();
+        let mut engine = V2ClientEngine::new(DriverTun::spawn(backend, engine_config()).unwrap());
+        assert_eq!(handle.wait_entered_read(1), 1);
+        assert_eq!(engine.mtu_admission().tun_payload_mtu().get(), SAFE_MODE_MIN_PAYLOAD_MTU);
+        engine.on_mtu_discovered(DatagramMtu::new(SAFE_MODE_MIN_DATAGRAM_MTU).unwrap());
+        assert!(engine.can_carry_tun_payload());
+        let state = engine.shutdown().await.unwrap();
+        assert_eq!(state, V2ClientEngineState::Closed);
+    }
+
+    #[tokio::test]
+    async fn engine_packet_sequencer_starts_at_zero_and_peeks_without_advancing() {
+        // WP-302 preview-closure blocker: the engine owns the packet-ID
+        // sequencer, the first ID is 0, and every public peek leaves the head
+        // untouched — public callers cannot advance the preview. The only
+        // advancing path is the checked send pipeline (tested in
+        // `sg-transport::mtu`), which the future uplink drives through
+        // `packet_sequencer_mut`.
+        let (backend, handle) = stub_pair();
+        let mut engine = V2ClientEngine::new(DriverTun::spawn(backend, engine_config()).unwrap());
+        assert_eq!(handle.wait_entered_read(1), 1);
+        assert_eq!(engine.packet_next_value(), 0);
+        assert_eq!(engine.packet_next_value(), 0, "repeated peeks never advance");
+        assert_eq!(engine.packet_sequencer_mut().next_value(), 0);
+        assert_eq!(engine.packet_next_value(), 0, "exclusive handle still peeks without advancing");
+        let state = engine.shutdown().await.unwrap();
+        assert_eq!(state, V2ClientEngineState::Closed);
     }
 }
