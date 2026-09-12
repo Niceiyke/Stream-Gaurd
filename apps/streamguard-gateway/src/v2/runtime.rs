@@ -582,4 +582,3 @@ async fn drive_control_connection(
     }
     ControlTaskOutcome { messages, completed: true }
 }
-
