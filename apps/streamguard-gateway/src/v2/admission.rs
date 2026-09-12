@@ -9,6 +9,7 @@ use std::fmt;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use sg_auth::device::{AdmissionTicketValidator, validate_admission_ticket};
 use sg_auth::ticket::{
@@ -157,19 +158,84 @@ impl fmt::Debug for AdmissionAccepted {
     }
 }
 
+/// Bounded time for durable replay journal I/O through the supervised owner
+/// queue. A durable consume that cannot persist within this budget fails
+/// closed with [`ReplayCacheError::Unavailable`] (mapped to
+/// [`AdmissionError::Unavailable`] at the admission boundary) so a stalled
+/// disk never hangs the async admission listener. The timed-out owner write
+/// may still complete later; the ticket is then treated as consumed (a retry
+/// observes `Replay`), which is fail-closed: no `SessionAdmit` is ever
+/// written without a durable redemption. Matches
+/// [`PERSISTENCE_IO_TIMEOUT`](super::persistence::PERSISTENCE_IO_TIMEOUT).
+pub const REPLAY_JOURNAL_IO_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// A bounded, atomic, fail-closed replay cache. Live entries are never evicted
 /// for capacity; only expiry plus fixed skew permits removal.
+///
+/// Two modes share this type so the admission handler never branches:
+///
+/// - **In-memory** (`ReplayCache::new`): single-run tests and non-durable
+///   callers. No file I/O.
+/// - **Durable single-gateway** (`ReplayCache::open_durable`): the
+///   admission-only entrypoint's local redemption journal
+///   (`super::replay`). Every `consume` persists the full snapshot with the
+///   atomic temp-file plus rename protocol while holding the single entries
+///   lock, so a crash leaves the old or the new journal, never a half-write.
+///   The journal header binds the file to one gateway name; opening a journal
+///   created for another gateway fails closed.
+///
+/// Blocking: the sync `consume` performs file I/O on its caller's thread
+/// while holding the single entries lock (single-guard serialization, matching
+/// the lease journal). Production async callers must use `consume_async`,
+/// which routes the same critical section through the supervised
+/// [`PersistenceOwner`](super::persistence::PersistenceOwner) (bounded queue,
+/// hard cap, `io_timeout` fail-closed) and never holds the entries lock or
+/// performs file I/O on the async executor thread. No detached
+/// `spawn_blocking` flood: at most `queue_capacity` consumes are ever queued.
 pub struct ReplayCache {
     capacity: usize,
     entries: Mutex<BTreeMap<TicketId, u64>>,
     replay_rejected: AtomicU64,
     capacity_rejected: AtomicU64,
     expired: AtomicU64,
+    journal_path: Option<std::path::PathBuf>,
+    journal_gateway: Option<String>,
+    persistence: Option<Arc<super::persistence::PersistenceOwner>>,
+    #[cfg(test)]
+    test_gate: Mutex<Option<std::sync::Arc<TestGate>>>,
+}
+
+/// Deterministic blocked-journal seam for tests. The gate is one-shot: the
+/// first durable `consume` that reaches the journal rewrite signals `entered`
+/// and blocks on `proceed` while still holding the single entries lock on its
+/// blocking thread (exactly like a stalled disk holding serialization).
+/// Subsequent consumes block behind the entries lock and also fail closed via
+/// `consume_async`'s timeout until the test sends `proceed`. Production code
+/// never installs a gate.
+#[cfg(test)]
+#[derive(Debug)]
+struct TestGate {
+    entered: std::sync::mpsc::Sender<()>,
+    proceed: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+#[cfg(test)]
+impl TestGate {
+    fn install(cache: &ReplayCache) -> (std::sync::Arc<Self>, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+        let gate = std::sync::Arc::new(Self {
+            entered: entered_tx,
+            proceed: std::sync::Mutex::new(Some(proceed_rx)),
+        });
+        *cache.test_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::sync::Arc::clone(&gate));
+        (gate, entered_rx, proceed_tx)
+    }
 }
 
 impl ReplayCache {
     pub fn new(capacity: usize) -> Result<Self, AdmissionError> {
-        if capacity == 0 {
+        if capacity == 0 || capacity > super::replay::MAX_REPLAY_ENTRIES_HARD_CAP {
             return Err(AdmissionError::InvalidConfiguration);
         }
         Ok(Self {
@@ -178,7 +244,70 @@ impl ReplayCache {
             replay_rejected: AtomicU64::new(0),
             capacity_rejected: AtomicU64::new(0),
             expired: AtomicU64::new(0),
+            journal_path: None,
+            journal_gateway: None,
+            persistence: None,
+            #[cfg(test)]
+            test_gate: Mutex::new(None),
         })
+    }
+
+    /// Opens (or creates) the durable single-gateway redemption journal.
+    ///
+    /// Missing file means an empty journal. Corrupt, trailing-data,
+    /// over-bound, duplicate, or gateway-mismatched journals fail closed with
+    /// [`AdmissionError::ReplayStore`]. Expired entries are pruned in memory
+    /// and the file is rewritten to its canonical form; a rewrite failure
+    /// also fails closed. Capacity is bounded by
+    /// `MAX_REPLAY_ENTRIES_HARD_CAP`.
+    pub fn open_durable(
+        journal_path: &std::path::Path,
+        gateway_name: &str,
+        capacity: usize,
+        now_unix_seconds: u64,
+    ) -> Result<Self, AdmissionError> {
+        if capacity == 0 || capacity > super::replay::MAX_REPLAY_ENTRIES_HARD_CAP {
+            return Err(AdmissionError::InvalidConfiguration);
+        }
+        let loaded = super::replay::read_replay_journal(journal_path, gateway_name, now_unix_seconds)
+            .map_err(|_| AdmissionError::ReplayStore)?;
+        if loaded.len() > capacity {
+            return Err(AdmissionError::ReplayStore);
+        }
+        let cache = Self {
+            capacity,
+            entries: Mutex::new(loaded),
+            replay_rejected: AtomicU64::new(0),
+            capacity_rejected: AtomicU64::new(0),
+            expired: AtomicU64::new(0),
+            journal_path: Some(journal_path.to_path_buf()),
+            journal_gateway: Some(gateway_name.to_owned()),
+            persistence: Some(Arc::new(super::persistence::PersistenceOwner::start(
+                super::persistence::PersistenceConfig::default(),
+            ))),
+            #[cfg(test)]
+            test_gate: Mutex::new(None),
+        };
+        // Canonicalize the file (pruned expiries, sorted order, valid header)
+        // so growth stays bounded across restarts. A failure fails closed:
+        // the gateway must not run with an unmaintainable journal.
+        cache.rewrite_journal_locked().map_err(|_| AdmissionError::ReplayStore)?;
+        Ok(cache)
+    }
+
+    /// Rewrites the journal from the current in-memory snapshot while holding
+    /// the single entries lock across the blocking file rewrite (single-guard
+    /// serialization, matching the lease journal). No-op when this cache is
+    /// in-memory. Construction-time only: the cache is not yet shared, so no
+    /// concurrent consumer can interleave.
+    fn rewrite_journal_locked(&self) -> Result<(), ReplayCacheError> {
+        let (Some(path), Some(gateway)) = (self.journal_path.as_ref(), self.journal_gateway.as_ref()) else {
+            return Ok(());
+        };
+        let entries = self.entries.lock().map_err(|_| ReplayCacheError::Unavailable)?;
+        super::replay::rewrite_replay_journal(path, gateway, &entries)
+            .map_err(|_| ReplayCacheError::Unavailable)?;
+        Ok(())
     }
 
     fn consume(
@@ -200,7 +329,97 @@ impl ReplayCache {
             return Err(ReplayCacheError::Capacity);
         }
         entries.insert(ticket_id, ticket_expiry_unix_seconds.saturating_add(REPLAY_EXPIRY_SKEW_SECONDS));
+        // Durable single-guard: persist the full snapshot while holding the
+        // single entries lock so concurrent consumes serialize and the file
+        // never drops a ticket (lost-update). This blocking file rewrite runs
+        // on the caller's thread: production async callers must use
+        // `consume_async` (bounded `spawn_blocking` with timeout) so no async
+        // executor thread ever blocks here and no entries lock is ever held
+        // across an await. A rewrite failure rolls back the in-memory insert
+        // and fails closed, so the ticket can be retried after the disk
+        // recovers rather than burning a live ticket.
+        if let (Some(path), Some(gateway)) = (self.journal_path.as_ref(), self.journal_gateway.as_ref()) {
+            #[cfg(test)]
+            {
+                // Deterministic blocked-journal seam (one-shot): when the test
+                // installs a gate, signal `entered` and block on `proceed`
+                // while still holding the single entries lock on this
+                // (blocking) thread, exactly like a stalled disk holding
+                // serialization. The async caller times out via
+                // `consume_async` without holding any lock on its own thread.
+                // The gate is consumed here so only the first rewrite blocks.
+                let gate = self
+                    .test_gate
+                    .lock()
+                    .map(|mut guard| guard.take())
+                    .unwrap_or(None);
+                if let Some(gate) = gate {
+                    let _ = gate.entered.send(());
+                    if let Ok(proceed) = gate.proceed.lock() {
+                        if let Some(receiver) = proceed.as_ref() {
+                            let _ = receiver.recv();
+                        }
+                    }
+                }
+            }
+            let snapshot = entries.clone();
+            if super::replay::rewrite_replay_journal(path, gateway, &snapshot).is_err() {
+                entries.remove(&ticket_id);
+                return Err(ReplayCacheError::Unavailable);
+            }
+        }
         Ok(())
+    }
+
+    /// Bounded async consume for the admission listener. In-memory caches run
+    /// inline (no I/O, brief lock, no owner). Durable caches route the same
+    /// single-guard critical section through the supervised owner queue
+    /// (hard cap, `try_send` backpressure, `io_timeout` fail-closed), so the
+    /// async listener never holds the entries lock and never performs file
+    /// I/O on its executor thread. `Full`/`Timeout`/`Closed` map to
+    /// `Unavailable` (fail closed, time bounded); the blocked owner write may
+    /// still complete later, in which case a retry observes `Replay` rather
+    /// than double-admitting. No detached `spawn_blocking` flood.
+    async fn consume_async(
+        self: Arc<Self>,
+        ticket_id: TicketId,
+        ticket_expiry_unix_seconds: u64,
+        now_unix_seconds: u64,
+    ) -> Result<(), ReplayCacheError> {
+        if !self.is_durable() {
+            return self.consume(ticket_id, ticket_expiry_unix_seconds, now_unix_seconds);
+        }
+        let Some(owner) = &self.persistence else {
+            return Err(ReplayCacheError::Unavailable);
+        };
+        let cache = Arc::clone(&self);
+        owner
+            .execute(move || cache.consume(ticket_id, ticket_expiry_unix_seconds, now_unix_seconds))
+            .await
+            .map_err(|_| ReplayCacheError::Unavailable)?
+    }
+
+    /// Closes the owner queue (no new persistence work) and joins the worker
+    /// with the bounded shutdown deadline. Never hangs indefinitely.
+    /// Idempotent. In-memory caches are a no-op.
+    pub async fn stop_persistence(&self) -> Option<super::persistence::PersistenceSnapshot> {
+        if let Some(owner) = &self.persistence {
+            Some(owner.stop().await)
+        } else {
+            None
+        }
+    }
+
+    /// Owner-queue metrics snapshot, if durable (counts only).
+    #[must_use]
+    pub fn persistence_snapshot(&self) -> Option<super::persistence::PersistenceSnapshot> {
+        self.persistence.as_ref().map(|owner| owner.snapshot())
+    }
+
+    /// True when this cache persists to the single-gateway journal.
+    #[must_use]
+    pub fn is_durable(&self) -> bool {
+        self.journal_path.is_some()
     }
 
     #[must_use]
@@ -212,6 +431,7 @@ impl ReplayCache {
             replay_rejected: self.replay_rejected.load(Ordering::Relaxed),
             capacity_rejected: self.capacity_rejected.load(Ordering::Relaxed),
             expired: self.expired.load(Ordering::Relaxed),
+            durable: self.journal_path.is_some(),
         }
     }
 }
@@ -229,6 +449,8 @@ pub struct ReplayCacheSnapshot {
     pub replay_rejected: u64,
     pub capacity_rejected: u64,
     pub expired: u64,
+    /// True when this cache persists to the single-gateway journal.
+    pub durable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,10 +643,15 @@ pub struct AdmissionMetricsSnapshot {
 
 /// Ticket admission is deliberately crate-private. The only public ingress is
 /// the V2 listener, which creates `VerifiedPeer` from Quinn's verified chain.
+///
+/// The replay cache is shared via `Arc` so the async admission path can route
+/// it through the supervised owner queue (`consume_async`, hard cap,
+/// backpressure, timeout) without holding the entries lock or performing file
+/// I/O on the async executor thread. No detached `spawn_blocking` flood.
 pub struct AdmissionHandler<V> {
     validator: V,
     limiter: HandshakeAdmissionLimiter,
-    replay_cache: ReplayCache,
+    replay_cache: Arc<ReplayCache>,
     sessions: Arc<V2SessionManager>,
     metrics: AdmissionMetrics,
 }
@@ -436,7 +663,13 @@ impl<V: AdmissionTicketValidator> AdmissionHandler<V> {
         replay_cache: ReplayCache,
         sessions: Arc<V2SessionManager>,
     ) -> Self {
-        Self { validator, limiter, replay_cache, sessions, metrics: AdmissionMetrics::default() }
+        Self {
+            validator,
+            limiter,
+            replay_cache: Arc::new(replay_cache),
+            sessions,
+            metrics: AdmissionMetrics::default(),
+        }
     }
 
     #[must_use]
@@ -464,7 +697,16 @@ impl<V: AdmissionTicketValidator> AdmissionHandler<V> {
         })
     }
 
-    pub(super) fn admit(
+    /// Production async admission for the V2 listener. Ticket validation and
+    /// session reservation run inline (brief locks, no I/O); the durable
+    /// replay consume runs on the supervised owner queue with
+    /// [`REPLAY_JOURNAL_IO_TIMEOUT`] via `consume_async`, so this future
+    /// never holds the replay entries lock and never performs file I/O on
+    /// the async executor thread. A journal timeout/full/closed fails closed
+    /// with [`AdmissionError::Unavailable`]. No lock is held across the await:
+    /// the limiter permit owns only an `Arc` (no guard), and the session-map
+    /// lock is acquired only inside the sync reservation after the await.
+    pub(super) async fn admit_async(
         &self,
         source: IpAddr,
         peer: VerifiedPeer,
@@ -496,8 +738,9 @@ impl<V: AdmissionTicketValidator> AdmissionHandler<V> {
             }
             AdmissionError::Ticket(error)
         })?;
-        self.replay_cache
-            .consume(ticket.ticket_id(), ticket.expires_at_unix_seconds(), now.unix_seconds)
+        Arc::clone(&self.replay_cache)
+            .consume_async(ticket.ticket_id(), ticket.expires_at_unix_seconds(), now.unix_seconds)
+            .await
             .map_err(|error| match error {
                 ReplayCacheError::Replay => AdmissionError::Replay,
                 ReplayCacheError::Capacity => AdmissionError::ReplayCapacity,
@@ -586,6 +829,14 @@ impl<V: AdmissionTicketValidator> AdmissionHandler<V> {
             .validate_attached_path(connection, path_id, path_epoch, key_epoch, now_ms)
     }
 
+    pub(super) fn record_authenticated_activity(
+        &self,
+        connection: AuthenticatedConnection,
+        now_ms: u64,
+    ) -> Result<(), V2SessionManagerError> {
+        self.sessions.record_authenticated_activity(connection, now_ms)
+    }
+
     pub(super) fn close_connection(
         &self,
         connection: AuthenticatedConnection,
@@ -598,6 +849,28 @@ impl<V: AdmissionTicketValidator> AdmissionHandler<V> {
         connection: AuthenticatedConnection,
     ) -> Result<bool, V2SessionManagerError> {
         self.sessions.close_session(connection)
+    }
+
+    /// Closes a session by its ID after its address lease expired. The
+    /// listener calls this for every session ID returned by
+    /// [`AddressPool::sweep`](crate::v2::address_pool::AddressPool::sweep) so
+    /// an expired lease never leaves a live session without addresses.
+    /// Idempotent: unknown sessions report `Ok(false)`. Cleanup (including
+    /// the durable lease release) runs after the session-map lock via the
+    /// registered [`SessionCleanup`](super::session_manager::SessionCleanup)
+    /// hooks, so the call order is always session map then address pool.
+    pub(crate) fn close_session_by_id(
+        &self,
+        session_id: SessionId,
+    ) -> Result<bool, V2SessionManagerError> {
+        self.sessions.close(session_id)
+    }
+
+    /// Closes the replay owner queue (no new persistence work) and joins the
+    /// worker with the bounded shutdown deadline. Never hangs indefinitely.
+    /// Idempotent. In-memory caches are a no-op.
+    pub async fn stop_persistence(&self) -> Option<super::persistence::PersistenceSnapshot> {
+        self.replay_cache.stop_persistence().await
     }
 }
 
@@ -621,6 +894,8 @@ pub enum AdmissionError {
     Replay,
     #[error("V2 ticket replay cache is at capacity")]
     ReplayCapacity,
+    #[error("V2 ticket redemption journal is unavailable")]
+    ReplayStore,
     #[error("V2 admission state is unavailable")]
     Unavailable,
     #[error("V2 session owner provisioning rejected admission")]
@@ -678,6 +953,122 @@ mod tests {
         assert_eq!(snapshot.replay_rejected, 1);
         assert_eq!(snapshot.capacity_rejected, 1);
         assert_eq!(snapshot.expired, 1);
+    }
+
+    #[tokio::test]
+    async fn durable_consume_async_is_time_bounded_and_shutdown_survives_blocked_journal() {
+        // Blocked-journal shutdown proof: the first durable consume blocks in
+        // the one-shot gate while holding the single entries lock on its
+        // blocking thread. The async caller must fail closed via
+        // `REPLAY_JOURNAL_IO_TIMEOUT` without holding any lock on its own
+        // thread, and shutdown (drop plus a post-unblock consume) must complete
+        // within hard deadlines. No sleep polling: `entered` plus completion
+        // acks order every assertion.
+        const OUTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let journal = std::env::temp_dir().join(format!("sg-replay-blocked-{nonce}.journal"));
+        let _ = std::fs::remove_file(&journal);
+        let cache = Arc::new(ReplayCache::open_durable(&journal, "blocked.test", 4, 1_000).unwrap());
+        assert!(cache.is_durable());
+        let (_gate, entered_rx, proceed_tx) = TestGate::install(&cache);
+
+        // First consume blocks in the gate on its blocking thread.
+        let blocked = Arc::clone(&cache);
+        let blocked_task = tokio::spawn(async move {
+            blocked.consume_async(TicketId::from_bytes([11; 16]), 2_000, 1_000).await
+        });
+        // Deterministic gate ack: the blocking thread reached the journal
+        // rewrite while holding the entries lock. Wait off the executor so the
+        // async listener thread never blocks.
+        let entered_result = tokio::task::spawn_blocking(move || entered_rx.recv_timeout(OUTER_TIMEOUT))
+            .await
+            .expect("entered wait must join");
+        assert!(entered_result.is_ok(), "blocked consume must reach the journal gate");
+
+        // Time-bounded fail-closed: the async caller times out via
+        // `REPLAY_JOURNAL_IO_TIMEOUT` (500 ms) even though the journal stays
+        // blocked, returning `Unavailable` rather than hanging. The outer
+        // timeout is only a hang backstop, not the assertion clock.
+        let blocked_result = tokio::time::timeout(OUTER_TIMEOUT, blocked_task)
+            .await
+            .expect("blocked consume must complete via inner timeout, not hang")
+            .expect("blocked task must join");
+        assert_eq!(blocked_result, Err(ReplayCacheError::Unavailable));
+
+        // Shutdown under blocked journal: dropping our handle while the
+        // blocking write still holds the entries lock must not hang. The
+        // background task holds its own `Arc` clone, so this drop is immediate;
+        // the outer timeout proves no hang.
+        let shutdown_cache = Arc::clone(&cache);
+        tokio::time::timeout(OUTER_TIMEOUT, async move { drop(shutdown_cache) })
+            .await
+            .expect("shutdown drop under blocked journal must not hang");
+
+        // Recovery: unblock the journal, then a fresh ticket must persist via
+        // the bounded blocking pool with an ack, proving no poisoned lock and
+        // no leaked serialization after the blocked episode.
+        let _ = proceed_tx.send(());
+        tokio::time::timeout(
+            OUTER_TIMEOUT,
+            Arc::clone(&cache).consume_async(TicketId::from_bytes([12; 16]), 2_000, 1_000),
+        )
+        .await
+        .expect("post-unblock consume must complete, not hang")
+        .expect("post-unblock consume must persist");
+        // The unblocked first write eventually persisted its ticket (fail-closed
+        // burn, not double-admit): a retry for the first ID is now `Replay`.
+        // Wait for that persistence deterministically via a bounded retry loop
+        // driven by completion acks, not sleeps: each attempt is itself
+        // time-bounded, and the loop exits on the first `Replay`.
+        let mut observed_replay = false;
+        for _ in 0..20 {
+            let attempt = tokio::time::timeout(
+                OUTER_TIMEOUT,
+                Arc::clone(&cache).consume_async(TicketId::from_bytes([11; 16]), 2_000, 1_000),
+            )
+            .await
+            .expect("retry must complete")
+            .expect_err("retry must fail (Replay or Unavailable while persisting)");
+            if attempt == ReplayCacheError::Replay {
+                observed_replay = true;
+                break;
+            }
+        }
+        assert!(observed_replay, "blocked ticket must persist as consumed after unblock");
+        let _ = std::fs::remove_file(&journal);
+        let _ = std::fs::remove_file(journal.with_extension("tmp"));
+    }
+
+    #[tokio::test]
+    async fn durable_consume_async_persists_without_blocking_the_listener() {
+        // Healthy durable path: `consume_async` runs the single-guard rewrite
+        // on the bounded blocking pool and returns `Ok`, with the journal file
+        // present for reopen. The listener never holds the entries lock across
+        // this await (the lock lives only on the blocking thread).
+        const OUTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let journal = std::env::temp_dir().join(format!("sg-replay-healthy-{nonce}.journal"));
+        let _ = std::fs::remove_file(&journal);
+        let cache = Arc::new(ReplayCache::open_durable(&journal, "healthy.test", 4, 1_000).unwrap());
+        tokio::time::timeout(
+            OUTER_TIMEOUT,
+            Arc::clone(&cache).consume_async(TicketId::from_bytes([21; 16]), 2_000, 1_000),
+        )
+        .await
+        .expect("healthy consume must complete")
+        .expect("healthy consume must persist");
+        assert_eq!(cache.snapshot().entries, 1);
+        drop(cache);
+        let reopened = ReplayCache::open_durable(&journal, "healthy.test", 4, 1_000).unwrap();
+        assert_eq!(reopened.snapshot().entries, 1);
+        let _ = std::fs::remove_file(&journal);
+        let _ = std::fs::remove_file(journal.with_extension("tmp"));
     }
 
     #[test]

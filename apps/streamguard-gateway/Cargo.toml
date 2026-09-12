@@ -10,6 +10,17 @@ description = "StreamGuard Linux gateway (transport -> session -> TUN -> NAT)"
 name = "streamguard-gateway"
 path = "src/main.rs"
 
+[[bin]]
+name = "streamguard-gateway-v2"
+path = "src/bin/gateway_v2.rs"
+required-features = ["v2-gateway"]
+
+[features]
+default = []
+# Admission-only V2 gateway entrypoint. Opt-in so the V1 development binary
+# (`streamguard-gateway`) never pulls V2 admission wiring by accident.
+v2-gateway = []
+
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
@@ -23,6 +34,11 @@ sg-protocol.workspace = true
 sg-session.workspace = true
 sg-transport = { workspace = true, features = ["quic"] }
 sg-tun.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

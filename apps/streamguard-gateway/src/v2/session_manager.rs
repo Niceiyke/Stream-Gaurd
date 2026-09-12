@@ -578,8 +578,11 @@ impl V2SessionManager {
     }
 
     /// Validates all untrusted header routing fields before any flow, dedup,
-    /// scheduler, address, or TUN resource is looked up.
-    #[allow(dead_code)] // V2 data ingress begins in WP-300; keep binding validation isolated here.
+    /// scheduler, address, or TUN resource is looked up. This is the sole
+    /// transport-binding gate for the sealed V2 uplink ingress (WP-400):
+    /// [`crate::v2::engine::V2GatewayEngine::ingest_uplink`] calls this first
+    /// (session, path, path/key epochs, direction, expiry, health) and only
+    /// then validates the IP source against the address pool.
     pub(crate) fn validate_ingress(
         &self,
         connection: AuthenticatedConnection,
@@ -634,6 +637,53 @@ impl V2SessionManager {
         result
     }
 
+    /// Records authenticated liveness for a session bound to an
+    /// authenticated connection (V2 Safe Mode renewal policy).
+    ///
+    /// Valid reliable control (`PathAttach` success, `PathDetach` success)
+    /// proves liveness even when it does not carry a datagram binding, so the
+    /// listener calls this after a successful control commit to extend
+    /// `last_activity_ms` (idle TTL). It checks the same expiry/idle gates as
+    /// [`V2SessionManager::validate_ingress`]: expired/idle sessions are
+    /// removed (with cleanup after the lock) and report `Expired`/`Idle`
+    /// instead of renewing. Unknown capabilities fail closed without touching
+    /// session state. Never logs identities.
+    pub(crate) fn record_authenticated_activity(
+        &self,
+        connection: AuthenticatedConnection,
+        now_ms: u64,
+    ) -> Result<(), V2SessionManagerError> {
+        let mut cleanup = None;
+        let result = {
+            let mut state = self.state.lock().map_err(|_| V2SessionManagerError::Unavailable)?;
+            if state.authenticated_connections.get(&connection.connection_id) != Some(&connection.session_id) {
+                return Err(V2SessionManagerError::UnknownConnection);
+            }
+            let Some(session) = state.sessions.get(&connection.session_id) else {
+                return Err(V2SessionManagerError::UnknownSession);
+            };
+            if session.session.is_expired(now_ms) {
+                cleanup = remove_session(&mut state, connection.session_id, SessionRemovalReason::Expired);
+                Err(V2SessionManagerError::Expired)
+            } else if now_ms.saturating_sub(session.last_activity_ms) >= self.config.idle_ttl_ms {
+                cleanup = remove_session(&mut state, connection.session_id, SessionRemovalReason::Idle);
+                Err(V2SessionManagerError::Idle)
+            } else if session.session.state() != SessionState::Active {
+                Err(V2SessionManagerError::Lifecycle)
+            } else if let Some(session) = state.sessions.get_mut(&connection.session_id) {
+                session.last_activity_ms = now_ms;
+                Ok(())
+            } else {
+                Err(V2SessionManagerError::UnknownSession)
+            }
+        };
+        if let Some(removal) = cleanup {
+            self.record_removal(removal.reason);
+            self.run_cleanup(removal);
+        }
+        result
+    }
+
     pub fn begin_draining(&self, session_id: SessionId) -> Result<(), V2SessionManagerError> {
         let mut state = self.state.lock().map_err(|_| V2SessionManagerError::Unavailable)?;
         state
@@ -658,6 +708,29 @@ impl V2SessionManager {
         } else {
             Ok(false)
         }
+    }
+
+    /// Removes every session once for runtime shutdown. Cleanup for each
+    /// removal runs after releasing the map lock (session map then address
+    /// pool, never nested). Returns the number of sessions closed. Idempotent:
+    /// an empty map reports zero.
+    pub fn close_all(&self) -> usize {
+        let removals = {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(_) => return 0,
+            };
+            let ids: Vec<SessionId> = state.sessions.keys().copied().collect();
+            ids.into_iter()
+                .filter_map(|id| remove_session(&mut state, id, SessionRemovalReason::Closed))
+                .collect::<Vec<_>>()
+        };
+        let count = removals.len();
+        for removal in removals {
+            self.record_removal(removal.reason);
+            self.run_cleanup(removal);
+        }
+        count
     }
 
     /// Closes every path and authenticated connection for this session. The
@@ -1246,24 +1319,34 @@ impl SupervisedSessionSweep {
         (sweep, trigger_handle)
     }
 
-    /// Signals the sweep task to shut down and waits for it to complete.
-    /// Returns the final metrics snapshot after the task exits.
-    ///
-    /// The production ticker is aborted first so no new ticks arrive while
-    /// draining. This method is idempotent: calling it after the task has
-    /// already stopped returns the current metrics without error.
+    /// Signals the sweep task to shut down and joins it with a bounded
+    /// deadline. Never hangs indefinitely: the ticker is aborted first, the
+    /// shutdown tick uses `try_send` (no indefinite wait), and both joins are
+    /// bounded with a hard timeout (stalled sweeps are aborted). Idempotent.
     pub async fn stop(&mut self) -> SweepMetrics {
         // Abort the production ticker first so no new ticks arrive.
         if let Some(handle) = self.ticker_handle.take() {
             handle.abort();
-            let _ = handle.await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
         }
-        // Signal the sweep task to shut down. The sweep task always drains
-        // the capacity-1 queue, so awaiting send can wait for at most one
-        // in-flight sweep to finish before the shutdown tick is queued.
-        let _ = self.tick_tx.send(SweepTick::Shutdown).await;
+        // Best-effort shutdown signal: never wait indefinitely when the
+        // capacity-1 queue is full.
+        let shutdown_queued = self.tick_tx.try_send(SweepTick::Shutdown).is_ok();
         if let Some(handle) = self.handle.take() {
-            let _ = handle.await;
+            if shutdown_queued {
+                // Session sweeps are synchronous and short; 2 s is a hard
+                // backstop, never the expected path.
+                if tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+                    .await
+                    .is_err()
+                {
+                    // Timeout detaches the task (it will exit on its next
+                    // poll); shutdown still returns within the deadline.
+                }
+            } else {
+                handle.abort();
+                let _ = handle.await;
+            }
         }
         self.metrics_snapshot()
     }
@@ -1383,7 +1466,7 @@ impl V2GatewayLifecycle {
 }
 
 #[cfg(test)]
-mod test_support {
+pub(crate) mod test_support {
     use super::*;
 
     /// Deterministic clock for tests. `monotonic_ms` returns the value set
@@ -1615,6 +1698,37 @@ mod tests {
         assert_eq!(manager.validate_ingress(connection, &wrong, 3), Err(V2SessionManagerError::InvalidDirection));
         assert_eq!(manager.validate_ingress(connection, &envelope(path), 100), Err(V2SessionManagerError::Expired));
         assert_eq!(manager.snapshot().sessions, 0);
+    }
+
+    #[test]
+    fn record_authenticated_activity_renews_idle_then_expires() {
+        // Control-plane liveness: valid control records activity (extends the
+        // idle deadline); unknown capabilities fail closed without touching
+        // state; expired/idle sessions are removed with cleanup instead of
+        // renewing. Deterministic `now_ms` only, no timers.
+        let manager = manager();
+        activate(&manager);
+        let live = connection(&manager);
+        // Valid activity at 2 extends idle (idle 10 from admission at 1).
+        assert!(manager.record_authenticated_activity(live, 2).is_ok());
+        // At 11 the original idle (1 + 10) would have fired, but activity at
+        // 2 moved it to 12, so the session survives.
+        assert_eq!(manager.sweep(11).unwrap(), 0);
+        assert_eq!(manager.snapshot().sessions, 1);
+        // Unknown capability fails closed without removing the session.
+        let foreign = AuthenticatedConnection { session_id: SESSION, connection_id: ConnectionId::new(999_999) };
+        assert_eq!(
+            manager.record_authenticated_activity(foreign, 3),
+            Err(V2SessionManagerError::UnknownConnection)
+        );
+        assert_eq!(manager.snapshot().sessions, 1);
+        // Idle past the renewed deadline removes the session.
+        assert_eq!(manager.sweep(12).unwrap(), 1);
+        assert_eq!(manager.snapshot().sessions, 0);
+        assert_eq!(
+            manager.record_authenticated_activity(live, 13),
+            Err(V2SessionManagerError::UnknownConnection)
+        );
     }
 
     #[test]
